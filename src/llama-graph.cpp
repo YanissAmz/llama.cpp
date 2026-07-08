@@ -337,6 +337,15 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->s_copy(i);
         }
     }
+
+    if (ids_identity && ids_identity->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(ids_identity->buffer));
+        int32_t * data = (int32_t *) ids_identity->data;
+
+        for (int64_t i = 0; i < ids_identity->ne[0]; ++i) {
+            data[i] = (int32_t) i;
+        }
+    }
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -350,6 +359,8 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= s_copy_extra->ne[0] == mctx->get_n_rs() - params.ubatch.n_seqs;
+
+    res &= !ids_identity || ids_identity->ne[0] == params.ubatch.n_seqs;
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
@@ -965,6 +976,15 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    if (inp_rs->ids_identity && inp_rs->ids_identity->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->ids_identity->buffer));
+        int32_t * data = (int32_t *) inp_rs->ids_identity->data;
+
+        for (int64_t i = 0; i < inp_rs->ids_identity->ne[0]; ++i) {
+            data[i] = (int32_t) i;
+        }
+    }
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -983,6 +1003,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
+
+    res &= !inp_rs->ids_identity || inp_rs->ids_identity->ne[0] == params.ubatch.n_seqs;
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
@@ -1009,6 +1031,15 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    if (inp_rs->ids_identity && inp_rs->ids_identity->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->ids_identity->buffer));
+        int32_t * data = (int32_t *) inp_rs->ids_identity->data;
+
+        for (int64_t i = 0; i < inp_rs->ids_identity->ne[0]; ++i) {
+            data[i] = (int32_t) i;
+        }
+    }
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1026,6 +1057,8 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
+
+    res &= !inp_rs->ids_identity || inp_rs->ids_identity->ne[0] == params.ubatch.n_seqs;
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
@@ -1083,6 +1116,15 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    if (inp_rs->ids_identity && inp_rs->ids_identity->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->ids_identity->buffer));
+        int32_t * data = (int32_t *) inp_rs->ids_identity->data;
+
+        for (int64_t i = 0; i < inp_rs->ids_identity->ne[0]; ++i) {
+            data[i] = (int32_t) i;
+        }
+    }
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -1114,6 +1156,8 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
+
+    res &= !inp_rs->ids_identity || inp_rs->ids_identity->ne[0] == params.ubatch.n_seqs;
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
@@ -3119,7 +3163,8 @@ ggml_tensor * llm_graph_context::build_rs(
 static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,
-    const llama_memory_recurrent_context * mctx_cur) {
+    const llama_memory_recurrent_context * mctx_cur,
+               uint32_t   n_rs_seq) {
 
     auto inp = std::make_unique<llm_graph_input_rs>(mctx_cur);
 
@@ -3132,6 +3177,11 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
 
+    if (n_rs_seq > 0) {
+        inp->ids_identity = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
+        ggml_set_input(inp->ids_identity);
+    }
+
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
 
@@ -3141,7 +3191,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 llm_graph_input_rs * llm_graph_context::build_rs_inp() const {
     const auto * mctx_cur = static_cast<const llama_memory_recurrent_context *>(mctx);
 
-    auto inp = build_rs_inp_impl(ctx0, ubatch, mctx_cur);
+    auto inp = build_rs_inp_impl(ctx0, ubatch, mctx_cur, cparams.n_rs_seq);
 
     return (llm_graph_input_rs *) res->add_input(std::move(inp));
 }
@@ -3203,7 +3253,7 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
 llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
-    auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
+    auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr(), cparams.n_rs_seq);
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
@@ -3214,7 +3264,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
 llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
-    auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
+    auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr(), cparams.n_rs_seq);
     auto inp_attn = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_k>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
@@ -3225,7 +3275,7 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
 llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_iswa_context *>(mctx);
 
-    auto inp_rs = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr());
+    auto inp_rs = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr(), cparams.n_rs_seq);
 
     // build iswa attention input
     const auto * attn_ctx = mctx_cur->get_attn();

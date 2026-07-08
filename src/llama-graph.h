@@ -261,6 +261,9 @@ public:
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
+    // identity gather indices [n_seqs], used to chain split ssm scans when rolling back state snapshots
+    ggml_tensor * ids_identity = nullptr;
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
