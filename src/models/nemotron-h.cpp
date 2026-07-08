@@ -200,7 +200,7 @@ llama_model_nemotron_h::graph::graph(const llama_model & model, const llm_graph_
             cur = build_ffn_layer(*this, cur, model, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -219,6 +219,14 @@ llama_model_nemotron_h::graph::graph(const llama_model & model, const llm_graph_
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
+
+    // post-norm hidden state feeds both the LM head and the MTP seed below
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
 
     // lm_head
     cur = build_lora_mm(model.output, cur, model.output_s);
