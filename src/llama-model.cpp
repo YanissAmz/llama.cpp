@@ -800,6 +800,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_102B_A12B:     return "102B.A12B";
         case LLM_TYPE_106B_A12B:     return "106B.A12B";
         case LLM_TYPE_120B_A12B:     return "120B.A12B";
+        case LLM_TYPE_75B_A9B:       return "75B.A9B";
         case LLM_TYPE_122B_A10B:     return "122B.A10B";
         case LLM_TYPE_196B_A11B:     return "196B.A11B";
         case LLM_TYPE_230B_A10B:     return "230B.A10B";
