@@ -3,17 +3,26 @@
 #include "fattn-common.cuh"
 #include "convert.cuh"
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-#if defined(TURING_MMA_AVAILABLE)
+#if !defined(GGML_USE_MUSA)
+#if defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
 typedef union {
     int2 i2;
     half2 h2[2];
 } half4;
 
-// TODO add support for AMD cards via rocWMMA
+#if defined(GGML_USE_HIP)
+// AMD path via rocWMMA (RDNA3/RDNA3.5/RDNA4). rocWMMA supports 16x16x16 half->float
+// natively, so HEADS_PER_INNER_LOOP is 16 here (vs 8 on NVIDIA's 8x32x16 wmma). The
+// dispatch passes K_VECS_PER_BLOCK=64 and the kernel processes it as 4 sequential
+// 16-wide (WMMA_N) sub-tiles, so each block amortizes its Q stream over 64 kvecs
+// (matching the vec kernel) while every WMMA op stays a pure 16x16x16 fragment.
+#include <rocwmma/rocwmma.hpp>
+namespace wmma = rocwmma;
+#else
 #include <mma.h>
 namespace wmma = nvcuda::wmma;
+#endif // defined(GGML_USE_HIP)
 
 template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K>
 static __global__ void lightning_indexer_kernel_wmma(
@@ -28,7 +37,17 @@ static __global__ void lightning_indexer_kernel_wmma(
     ) {
 
     constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
-    constexpr int HEADS_PER_INNER_LOOP = 8;
+#if defined(GGML_USE_HIP)
+    constexpr int HEADS_PER_INNER_LOOP = 16; // rocWMMA native 16x16x16
+    constexpr int WMMA_N = 16;               // rocWMMA fragment N (kvecs per WMMA op)
+#else
+    constexpr int HEADS_PER_INNER_LOOP = 8;  // nvcuda 8x32x16
+    constexpr int WMMA_N = K_VECS_PER_BLOCK; // nvcuda uses the full block width as N
+#endif
+    // On HIP the block is wider than one WMMA op: it is processed as N_SUBTILES
+    // sequential 16-wide sub-tiles so a block's Q stream is amortized over 64 kvecs
+    // (like the vec kernel) instead of 16, without inflating LDS. NVIDIA: N_SUBTILES=1.
+    constexpr int N_SUBTILES = K_VECS_PER_BLOCK / WMMA_N;
     constexpr int K_EMBD_PER_INNER_LOOP = 16;
     constexpr int N_EMBD_PADDED = N_EMBD + 8;
 
@@ -108,23 +127,26 @@ static __global__ void lightning_indexer_kernel_wmma(
 
     // phase 3 - calculate lightning indexer scores
 
-    __shared__ float qk_shared[WARPS_PER_BLOCK][HEADS_PER_INNER_LOOP][K_VECS_PER_BLOCK];
+    __shared__ float qk_shared[WARPS_PER_BLOCK][HEADS_PER_INNER_LOOP][WMMA_N];
 
-    // load K fragment
-    wmma::fragment<wmma::matrix_b, HEADS_PER_INNER_LOOP, K_VECS_PER_BLOCK, K_EMBD_PER_INNER_LOOP, half, wmma::col_major> frag_k;
-    wmma::load_matrix_sync(frag_k, (half*) &k_shared_h[0][i_warp * K_EMBD_PER_INNER_LOOP / 4], N_EMBD_PADDED);
+    // preload one K fragment per sub-tile (K is reused across every head group)
+    wmma::fragment<wmma::matrix_b, HEADS_PER_INNER_LOOP, WMMA_N, K_EMBD_PER_INNER_LOOP, half, wmma::col_major> frag_k[N_SUBTILES];
+#pragma unroll
+    for (int s = 0; s < N_SUBTILES; ++s) {
+        wmma::load_matrix_sync(frag_k[s], (half*) &k_shared_h[s * WMMA_N][i_warp * K_EMBD_PER_INNER_LOOP / 4], N_EMBD_PADDED);
+    }
 
-    float score_k = 0.0f;
+    float score_k[N_SUBTILES];
+#pragma unroll
+    for (int s = 0; s < N_SUBTILES; ++s) {
+        score_k[s] = 0.0f;
+    }
 
     for (int i_head_0 = 0; i_head_0 < N_HEAD; i_head_0 += HEADS_PER_INNER_LOOP) {
         const int i_head_next = i_head_0 + HEADS_PER_INNER_LOOP;
 
-        // we don't use accumulator for anything, fill it with zeros
-        wmma::fragment<wmma::accumulator, HEADS_PER_INNER_LOOP, K_VECS_PER_BLOCK, K_EMBD_PER_INNER_LOOP, float> frag_acc;
-        wmma::fill_fragment(frag_acc, 0.0f);
-
-        // load Q fragment
-        wmma::fragment<wmma::matrix_a, HEADS_PER_INNER_LOOP, K_VECS_PER_BLOCK, K_EMBD_PER_INNER_LOOP, half, wmma::row_major> frag_q;
+        // load Q fragment (kept in registers, reused across all sub-tiles of this head group)
+        wmma::fragment<wmma::matrix_a, HEADS_PER_INNER_LOOP, WMMA_N, K_EMBD_PER_INNER_LOOP, half, wmma::row_major> frag_q;
         wmma::load_matrix_sync(frag_q, (half*) &q_shared_h[0][i_warp * K_EMBD_PER_INNER_LOOP / 4], N_EMBD_PADDED);
 
         // preload next Q tile to registers during matrix multiplication
@@ -139,14 +161,60 @@ static __global__ void lightning_indexer_kernel_wmma(
             }
         }
 
-        // perform matrix multiplication
-        wmma::mma_sync(frag_acc, frag_q, frag_k, frag_acc);
-        wmma::store_matrix_sync((float*) &qk_shared[i_warp][0][0], frag_acc, K_VECS_PER_BLOCK, wmma::mem_row_major);
+        // process each 16-wide sub-tile of K in sequence, reducing into the narrow
+        // qk_shared each time so LDS stays flat while frag_q is streamed only once
+#pragma unroll
+        for (int s = 0; s < N_SUBTILES; ++s) {
+            // we don't use accumulator for anything, fill it with zeros
+            wmma::fragment<wmma::accumulator, HEADS_PER_INNER_LOOP, WMMA_N, K_EMBD_PER_INNER_LOOP, float> frag_acc;
+            wmma::fill_fragment(frag_acc, 0.0f);
 
-        // make sure all threads finished using q_shared_h so we can store next tile
-        __syncthreads();
+            // perform matrix multiplication
+            wmma::mma_sync(frag_acc, frag_q, frag_k[s], frag_acc);
+            wmma::store_matrix_sync((float*) &qk_shared[i_warp][0][0], frag_acc, WMMA_N, wmma::mem_row_major);
 
-        // write preloaded Q tile to shared memory
+            __syncthreads();
+
+            // accumulate QK multiplication results from all block warps
+            // (there are 256 threads in block and HEADS_PER_INNER_LOOP*WMMA_N matmul outputs)
+            // TODO it will break if WARP_SIZE is not 32
+            const int h = tid / WMMA_N;
+            const int k = tid % WMMA_N;
+            const float w_val = w_shared[i_head_0 + h];
+
+            float sum = 0.0f;
+#pragma unroll
+            for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
+                sum += qk_shared[w][h][k];
+            }
+
+            // ReLU, weight
+            sum = sum > 0.0f ? sum : 0.0f;
+            sum *= w_val;
+
+            // wait until qk_shared[0] is no longer used
+            __syncthreads();
+
+            // reuse qk_shared[0] for storing partial results
+            qk_shared[0][h][k] = sum;
+
+            // wait until all threads write their results
+            __syncthreads();
+
+            // accumulate result over heads into this sub-tile's score
+            if (tid < WMMA_N) {
+#pragma unroll
+                for (int i_head = 0; i_head < HEADS_PER_INNER_LOOP; ++i_head) {
+                    score_k[s] += qk_shared[0][i_head][tid];
+                }
+            }
+
+            // make sure all threads finished using qk_shared
+            __syncthreads();
+        }
+
+        // write preloaded Q tile to shared memory for the next head group
+        // (frag_q is already in registers, so overwriting q_shared_h is safe)
         if (i_head_next < N_HEAD) {
 #pragma unroll
             for (int i_q = tid, i_q_next = 0; i_q < N_Q_TILE; i_q += THREADS_PER_BLOCK) {
@@ -160,52 +228,21 @@ static __global__ void lightning_indexer_kernel_wmma(
             }
         }
 
-        // accumulate QK multiplication results from all block warps
-        // (there are 256 threads in block and 256 matmul outputs)
-        // TODO it will break if WARP_SIZE is not 32
-        const int h = tid / K_VECS_PER_BLOCK;
-        const int k = tid % K_VECS_PER_BLOCK;
-        const float w_val = w_shared[i_head_0 + h];
-
-        float sum = 0.0f;
-#pragma unroll
-        for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
-            sum += qk_shared[w][h][k];
-        }
-
-        // ReLU, weight
-        sum = sum > 0.0f ? sum : 0.0f;
-        sum *= w_val;
-
-        // wait until qk_shared[0] is no longer used
-        __syncthreads();
-
-        // reuse qk_shared[0] for storing partial results
-        qk_shared[0][h][k] = sum;
-
-        // wait until all threads write their results
-        __syncthreads();
-
-        // accumulate result over heads
-        if (tid < K_VECS_PER_BLOCK) {
-#pragma unroll
-            for (int i_head = 0; i_head < HEADS_PER_INNER_LOOP; ++i_head) {
-                score_k += qk_shared[0][i_head][tid];
-            }
-        }
-
-        // make sure all threads finished using qk_shared
+        // ensure q_shared_h is fully written before the next head group loads frag_q
         __syncthreads();
     }
 
     // phase 4 - store output to VRAM
 
-    if (tid < K_VECS_PER_BLOCK) {
-        const int i_kv = start_kv + tid;
-        if (i_kv < n_kv) {
-            const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
-            float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
-            dst_base[i_kv] = score_k + __half2float(m_base[i_kv]);
+    if (tid < WMMA_N) {
+        const half  * m_base   = (const half  *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
+        float       * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
+#pragma unroll
+        for (int s = 0; s < N_SUBTILES; ++s) {
+            const int i_kv = start_kv + s * WMMA_N + tid;
+            if (i_kv < n_kv) {
+                dst_base[i_kv] = score_k[s] + __half2float(m_base[i_kv]);
+            }
         }
     }
 }
@@ -233,8 +270,8 @@ static __global__ void lightning_indexer_kernel_wmma(
     NO_DEVICE_CODE;
 }
 
-#endif // defined(TURING_MMA_AVAILABLE)
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+#endif // !defined(GGML_USE_MUSA)
 
 // TODO there is one ugly assumption used in this kernel - that WARP_SIZE is equal to 32
 // thanks to that one warp operating on float4 processes whole indexer K/Q vectors
@@ -398,6 +435,13 @@ static __global__ void lightning_indexer_kernel_vec(
     } else
 
 void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // Ablation gate (env DSV4_ABLATE_INDEXER): skip indexer compute, zero the
+    // scores. Corrupts output; for prefill-timing isolation only. Delta between
+    // baseline and ablated pp t/s = the indexer kernel's share of prefill.
+    if (getenv("DSV4_ABLATE_INDEXER")) {
+        CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+        return;
+    }
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
     const ggml_tensor * w = dst->src[2]; // weights
@@ -447,10 +491,17 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc     = ggml_cuda_info().devices[device].cc;
 
     if (n_embd == 128 && n_head == 64) {
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
+#if !defined(GGML_USE_MUSA)
+#if defined(GGML_USE_HIP)
+        const bool use_wmma = amd_wmma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16;
+        constexpr int WMMA_K_VECS_PER_BLOCK = 64; // rocWMMA 16x16x16 x4 sub-tiles per block
+#else
+        const bool use_wmma = GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16;
+        constexpr int WMMA_K_VECS_PER_BLOCK = 32; // nvcuda 8x32x16
+#endif // defined(GGML_USE_HIP)
+        if (use_wmma) {
             // use wmma kernel
-            constexpr int K_VECS_PER_BLOCK = 32;
+            constexpr int K_VECS_PER_BLOCK = WMMA_K_VECS_PER_BLOCK;
             constexpr int WARPS_PER_BLOCK = 8;
 
             dim3 block(32, WARPS_PER_BLOCK);
@@ -464,10 +515,9 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 64, k, GGML_TYPE_Q5_1)
             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 64, k, GGML_TYPE_Q8_0)
             GGML_ABORT("fatal error");
-        } else {
-#else // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        } else
+#endif // !defined(GGML_USE_MUSA)
         {
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             // use vector kernel
             constexpr int K_VECS_PER_WARP = 8;
             constexpr int WARPS_PER_BLOCK = 8;

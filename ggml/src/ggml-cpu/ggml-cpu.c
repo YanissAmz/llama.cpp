@@ -2064,6 +2064,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
             } break;
+        case GGML_OP_HC_SINKHORN:
+            {
+                ggml_compute_forward_hc_sinkhorn(params, tensor);
+            } break;
+        case GGML_OP_HC_COMBINE:
+            {
+                ggml_compute_forward_hc_combine(params, tensor);
+            } break;
+        case GGML_OP_HC_WSUM:
+            {
+                ggml_compute_forward_hc_wsum(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2385,6 +2397,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
+        case GGML_OP_HC_SINKHORN:
+        case GGML_OP_HC_COMBINE:
+        case GGML_OP_HC_WSUM:
             {
                 n_tasks = n_threads;
             } break;

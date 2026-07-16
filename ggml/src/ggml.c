@@ -1080,6 +1080,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "LIGHTNING_INDEXER",
+    "HC_SINKHORN",
+    "HC_COMBINE",
+    "HC_WSUM",
 
     "UNARY",
 
@@ -1097,7 +1100,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1192,6 +1195,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "lightning_indexer(q, k, weights, mask)",
+    "hc_sinkhorn(comb)",
+    "hc_combine(x, residual, post, comb)",
+    "hc_wsum(x, weights)",
 
     "unary(x)",
 
@@ -1209,7 +1215,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6333,6 +6339,97 @@ struct ggml_tensor * ggml_lightning_indexer(
     result->src[1] = k;
     result->src[2] = weights;
     result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_hc_sinkhorn
+
+struct ggml_tensor * ggml_hc_sinkhorn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * comb,
+        int                   n_iters,
+        float                 eps) {
+
+    GGML_ASSERT(comb->type == GGML_TYPE_F32);
+    GGML_ASSERT(comb->ne[0] == comb->ne[1]);
+    GGML_ASSERT(n_iters > 0);
+    GGML_ASSERT(ggml_is_contiguous(comb));
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, comb);
+
+    ggml_set_op_params_i32(result, 0, n_iters);
+    ggml_set_op_params_f32(result, 1, eps);
+
+    result->op   = GGML_OP_HC_SINKHORN;
+    result->src[0] = comb;
+
+    return result;
+}
+
+// ggml_hc_combine
+
+struct ggml_tensor * ggml_hc_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * post,
+        struct ggml_tensor  * comb) {
+
+    GGML_ASSERT(       x->type == GGML_TYPE_F32);
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(    post->type == GGML_TYPE_F32);
+    GGML_ASSERT(    comb->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(residual));
+    GGML_ASSERT(ggml_is_contiguous(post));
+    GGML_ASSERT(ggml_is_contiguous(comb));
+
+    const int64_t hc = residual->ne[1];
+
+    GGML_ASSERT(x->ne[0] == residual->ne[0]);
+    GGML_ASSERT(x->ne[1] == residual->ne[2]);
+    GGML_ASSERT(post->ne[0] == hc);
+    GGML_ASSERT(post->ne[1] == x->ne[1]);
+    GGML_ASSERT(comb->ne[0] == hc);
+    GGML_ASSERT(comb->ne[1] == hc);
+    GGML_ASSERT(comb->ne[2] == x->ne[1]);
+
+    int64_t ne[4] = { x->ne[0], hc, x->ne[1], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op   = GGML_OP_HC_COMBINE;
+    result->src[0] = x;
+    result->src[1] = residual;
+    result->src[2] = post;
+    result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_hc_wsum
+
+struct ggml_tensor * ggml_hc_wsum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * weights) {
+
+    GGML_ASSERT(      x->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(weights));
+
+    GGML_ASSERT(x->ne[1] == weights->ne[0]);
+    GGML_ASSERT(x->ne[2] == weights->ne[1]);
+
+    int64_t ne[4] = { x->ne[0], x->ne[2], 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op   = GGML_OP_HC_WSUM;
+    result->src[0] = x;
+    result->src[1] = weights;
 
     return result;
 }

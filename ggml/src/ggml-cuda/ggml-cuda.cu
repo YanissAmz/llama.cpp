@@ -66,6 +66,9 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/hc-sinkhorn.cuh"
+#include "ggml-cuda/hc-combine.cuh"
+#include "ggml-cuda/hc-wsum.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2260,6 +2263,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
+            break;
+        case GGML_OP_HC_SINKHORN:
+            ggml_cuda_hc_sinkhorn(ctx, dst);
+            break;
+        case GGML_OP_HC_COMBINE:
+            ggml_cuda_hc_combine(ctx, dst);
+            break;
+        case GGML_OP_HC_WSUM:
+            ggml_cuda_hc_wsum(ctx, dst);
             break;
         default:
             return false;
@@ -4983,6 +4995,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_HC_SINKHORN:
+            return op->src[0]->ne[0] == op->src[0]->ne[1] && op->src[0]->ne[0] <= 8;
+        case GGML_OP_HC_COMBINE:
+            return op->src[1]->ne[1] <= 8;
+        case GGML_OP_HC_WSUM:
+            return op->src[0]->ne[1] <= 8;
 
         default:
             return false;

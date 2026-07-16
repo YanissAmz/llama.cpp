@@ -4,8 +4,27 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+
+static bool dsv4_hc_fused_enabled() {
+    static const bool no_fused = getenv("DSV4_NO_FUSED_SINKHORN") != nullptr;
+    return !no_fused;
+}
+// Per-op bisection gates (each also disabled by the global DSV4_NO_FUSED_SINKHORN).
+static bool dsv4_fuse_sinkhorn() {
+    static const bool off = getenv("DSV4_NO_FUSE_SINKHORN") != nullptr;
+    return dsv4_hc_fused_enabled() && !off;
+}
+static bool dsv4_fuse_combine() {
+    static const bool off = getenv("DSV4_NO_FUSE_COMBINE") != nullptr;
+    return dsv4_hc_fused_enabled() && !off;
+}
+static bool dsv4_fuse_wsum() {
+    static const bool off = getenv("DSV4_NO_FUSE_WSUM") != nullptr;
+    return dsv4_hc_fused_enabled() && !off;
+}
 
 static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
     if (ext_factor == 0.0f) {
@@ -203,6 +222,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_weighted_sum(
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = x->ne[2];
 
+    if (dsv4_fuse_wsum()) {
+        return ggml_hc_wsum(ctx0, x, weights);
+    }
+
     ggml_tensor * acc = nullptr;
     for (int64_t ih = 0; ih < hc; ++ih) {
         ggml_tensor * xh = ggml_view_2d(ctx0, x, n_embd, nt, x->nb[2], ih*x->nb[1]);
@@ -219,6 +242,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_sinkhorn(
         ggml_tensor * comb,
         int           il) const {
     GGML_UNUSED(il);
+
+    if (dsv4_fuse_sinkhorn()) {
+        return ggml_hc_sinkhorn(ctx0, comb, (int) hparams.dsv4_hc_sinkhorn_iters, hparams.dsv4_hc_eps);
+    }
 
     // comb is [dst_hc, src_hc, n_tokens]. Sinkhorn follows the reference:
     // row softmax over dst, one column normalization, then repeated row/column normalization.
@@ -309,6 +336,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
         ggml_tensor * comb,
         int il) const {
     GGML_UNUSED(il);
+
+    if (dsv4_fuse_combine()) {
+        return ggml_hc_combine(ctx0, x, residual, post, comb);
+    }
 
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = x->ne[1];

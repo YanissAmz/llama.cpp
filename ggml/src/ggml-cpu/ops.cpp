@@ -11654,3 +11654,209 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// ggml_compute_forward_hc_sinkhorn
+
+void ggml_compute_forward_hc_sinkhorn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t hc_dst = src0->ne[0];
+    const int64_t hc_src = src0->ne[1];
+    const int64_t nt     = src0->ne[2] * src0->ne[3];
+
+    GGML_ASSERT(hc_dst == hc_src);
+
+    constexpr int64_t HC_SINKHORN_MAX_HC = 8;
+    GGML_ASSERT(hc_dst <= HC_SINKHORN_MAX_HC);
+
+    const int n_iters = ggml_get_op_params_i32(dst, 0);
+    const float eps   = ggml_get_op_params_f32(dst, 1);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr = (nt + nth - 1)/nth;
+    const int64_t t0 = MIN(dr*ith, nt);
+    const int64_t t1 = MIN(t0 + dr, nt);
+
+    const float * src_data = (const float *) src0->data;
+    float       * dst_data = (      float *) dst->data;
+
+    float c[HC_SINKHORN_MAX_HC][HC_SINKHORN_MAX_HC];
+
+    for (int64_t t = t0; t < t1; ++t) {
+        const float * row = src_data + t*hc_dst*hc_src;
+
+        for (int64_t s = 0; s < hc_src; ++s) {
+            float max_v = -INFINITY;
+            for (int64_t d = 0; d < hc_dst; ++d) {
+                max_v = MAX(max_v, row[d + s*hc_dst]);
+            }
+            float sum_v = 0.0f;
+            for (int64_t d = 0; d < hc_dst; ++d) {
+                const float v = expf(row[d + s*hc_dst] - max_v);
+                c[d][s] = v;
+                sum_v += v;
+            }
+            for (int64_t d = 0; d < hc_dst; ++d) {
+                c[d][s] = c[d][s]/sum_v + eps;
+            }
+        }
+
+        auto norm_cols = [&]() {
+            for (int64_t d = 0; d < hc_dst; ++d) {
+                float sum_v = 0.0f;
+                for (int64_t s = 0; s < hc_src; ++s) {
+                    sum_v += c[d][s];
+                }
+                sum_v += eps;
+                for (int64_t s = 0; s < hc_src; ++s) {
+                    c[d][s] /= sum_v;
+                }
+            }
+        };
+
+        auto norm_rows = [&]() {
+            for (int64_t s = 0; s < hc_src; ++s) {
+                float sum_v = 0.0f;
+                for (int64_t d = 0; d < hc_dst; ++d) {
+                    sum_v += c[d][s];
+                }
+                sum_v += eps;
+                for (int64_t d = 0; d < hc_dst; ++d) {
+                    c[d][s] /= sum_v;
+                }
+            }
+        };
+
+        norm_cols();
+        for (int i = 1; i < n_iters; ++i) {
+            norm_rows();
+            norm_cols();
+        }
+
+        float * dst_row = dst_data + t*hc_dst*hc_src;
+        for (int64_t s = 0; s < hc_src; ++s) {
+            for (int64_t d = 0; d < hc_dst; ++d) {
+                dst_row[d + s*hc_dst] = c[d][s];
+            }
+        }
+    }
+}
+
+// ggml_compute_forward_hc_combine
+
+void ggml_compute_forward_hc_combine(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * residual = dst->src[1];
+    const ggml_tensor * post     = dst->src[2];
+    const ggml_tensor * comb     = dst->src[3];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(residual));
+    GGML_ASSERT(ggml_is_contiguous(post));
+    GGML_ASSERT(ggml_is_contiguous(comb));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t n_embd = x->ne[0];
+    const int64_t nt     = x->ne[1];
+    const int64_t hc     = residual->ne[1];
+
+    const float * x_d   = (const float *) x->data;
+    const float * res_d = (const float *) residual->data;
+    const float * post_d = (const float *) post->data;
+    const float * comb_d = (const float *) comb->data;
+    float       * dst_d = (      float *) dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr = (nt + nth - 1)/nth;
+    const int64_t t0 = MIN(dr*ith, nt);
+    const int64_t t1 = MIN(t0 + dr, nt);
+
+    for (int64_t t = t0; t < t1; ++t) {
+        const float * x_row    = x_d   + t*n_embd;
+        const float * res_row  = res_d + t*n_embd*hc;
+        const float * post_row = post_d + t*hc;
+        const float * comb_row = comb_d + t*hc*hc;
+        float       * dst_row  = dst_d + t*n_embd*hc;
+
+        for (int64_t dst_h = 0; dst_h < hc; ++dst_h) {
+            const float post_v = post_row[dst_h];
+            float * out_row = dst_row + dst_h*n_embd;
+
+            for (int64_t e = 0; e < n_embd; ++e) {
+                out_row[e] = x_row[e]*post_v;
+            }
+
+            for (int64_t src_h = 0; src_h < hc; ++src_h) {
+                const float comb_v = comb_row[dst_h + src_h*hc];
+                const float * res_h = res_row + src_h*n_embd;
+                for (int64_t e = 0; e < n_embd; ++e) {
+                    out_row[e] += res_h[e]*comb_v;
+                }
+            }
+        }
+    }
+}
+
+// ggml_compute_forward_hc_wsum
+
+void ggml_compute_forward_hc_wsum(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * x       = dst->src[0];
+    const ggml_tensor * weights = dst->src[1];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(weights));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t n_embd = x->ne[0];
+    const int64_t hc     = x->ne[1];
+    const int64_t nt     = x->ne[2];
+
+    const float * x_d = (const float *) x->data;
+    const float * w_d = (const float *) weights->data;
+    float       * dst_d = (      float *) dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr = (nt + nth - 1)/nth;
+    const int64_t t0 = MIN(dr*ith, nt);
+    const int64_t t1 = MIN(t0 + dr, nt);
+
+    for (int64_t t = t0; t < t1; ++t) {
+        const float * x_row = x_d + t*n_embd*hc;
+        const float * w_row = w_d + t*hc;
+        float       * dst_row = dst_d + t*n_embd;
+
+        for (int64_t e = 0; e < n_embd; ++e) {
+            dst_row[e] = 0.0f;
+        }
+
+        for (int64_t ih = 0; ih < hc; ++ih) {
+            const float w_v = w_row[ih];
+            const float * x_h = x_row + ih*n_embd;
+            for (int64_t e = 0; e < n_embd; ++e) {
+                dst_row[e] += x_h[e]*w_v;
+            }
+        }
+    }
+}

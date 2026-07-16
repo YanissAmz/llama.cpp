@@ -571,6 +571,9 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_HC_SINKHORN,
+        GGML_OP_HC_COMBINE,
+        GGML_OP_HC_WSUM,
 
         GGML_OP_UNARY,
 
@@ -2597,6 +2600,53 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    // DeepSeek-V4 hyper-connection Sinkhorn normalization, fused
+    //
+    // comb: [dst_hc, src_hc, n_tokens]
+    //
+    // res = comb after:
+    //   1. row softmax over dst_hc (ne0)
+    //   2. += eps
+    //   3. normalize so that, for each dst_hc, the sum over src_hc (+eps) is 1
+    //   4. (n_iters - 1) times: normalize so that, for each src_hc, the sum over dst_hc (+eps)
+    //      is 1; then repeat step 3
+    //
+    GGML_API struct ggml_tensor * ggml_hc_sinkhorn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * comb,
+        int                   n_iters,
+        float                 eps);
+
+    // DeepSeek-V4 hyper-connection post-combine, fused
+    //
+    // x:        [n_embd, n_tokens]
+    // residual:  [n_embd, hc, n_tokens]
+    // post:      [hc, n_tokens]
+    // comb:      [hc(dst), hc(src), n_tokens]
+    // res:       [n_embd, hc(dst), n_tokens]
+    //
+    // res[e,dst,t] = x[e,t]*post[dst,t] + sum_src residual[e,src,t]*comb[dst,src,t]
+    //
+    GGML_API struct ggml_tensor * ggml_hc_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * post,
+        struct ggml_tensor  * comb);
+
+    // DeepSeek-V4 hyper-connection weighted sum, fused
+    //
+    // x:       [n_embd, hc, n_tokens]
+    // weights: [hc, n_tokens]
+    // res:     [n_embd, n_tokens]
+    //
+    // res[e,t] = sum_ih x[e,ih,t]*weights[ih,t]
+    //
+    GGML_API struct ggml_tensor * ggml_hc_wsum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * weights);
 
     // custom operators
 

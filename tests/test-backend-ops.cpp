@@ -7160,6 +7160,110 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+// GGML_OP_HC_SINKHORN
+struct test_hc_sinkhorn : public test_case {
+    const int64_t hc;
+    const int64_t nt;
+    const int     n_iters;
+    const float   eps;
+
+    std::string vars() override {
+        return VARS_TO_STR4(hc, nt, n_iters, eps);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_hc_sinkhorn(int64_t hc = 4, int64_t nt = 7, int n_iters = 20, float eps = 1e-6f)
+        : hc(hc), nt(nt), n_iters(n_iters), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, nt);
+        ggml_set_param(comb);
+        ggml_set_name(comb, "comb");
+
+        ggml_tensor * out = ggml_hc_sinkhorn(ctx, comb, n_iters, eps);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// GGML_OP_HC_COMBINE
+struct test_hc_combine : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t nt;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, hc, nt);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_hc_combine(int64_t n_embd = 64, int64_t hc = 4, int64_t nt = 7)
+        : n_embd(n_embd), hc(hc), nt(nt) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
+        ggml_set_param(x);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+        ggml_set_param(residual);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, nt);
+        ggml_set_param(post);
+        ggml_set_name(post, "post");
+
+        ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, nt);
+        ggml_set_param(comb);
+        ggml_set_name(comb, "comb");
+
+        ggml_tensor * out = ggml_hc_combine(ctx, x, residual, post, comb);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// GGML_OP_HC_WSUM
+struct test_hc_wsum : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t nt;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, hc, nt);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_hc_wsum(int64_t n_embd = 64, int64_t hc = 4, int64_t nt = 7)
+        : n_embd(n_embd), hc(hc), nt(nt) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+        ggml_set_param(x);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, nt);
+        ggml_set_param(weights);
+        ggml_set_name(weights, "weights");
+
+        ggml_tensor * out = ggml_hc_wsum(ctx, x, weights);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -9469,6 +9573,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     }
                 }
             }
+        }
+    }
+
+    // hc_sinkhorn
+    for (int64_t nt : { 1, 7, 2048 }) {
+        test_cases.emplace_back(new test_hc_sinkhorn(4, nt, 20, 1e-6f));
+    }
+
+    // hc_combine / hc_wsum
+    for (int64_t n_embd : { 64, 4096 }) {
+        for (int64_t nt : { 1, 7, 2048 }) {
+            test_cases.emplace_back(new test_hc_combine(n_embd, 4, nt));
+            test_cases.emplace_back(new test_hc_wsum(n_embd, 4, nt));
         }
     }
 
