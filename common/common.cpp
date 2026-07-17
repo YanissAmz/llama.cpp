@@ -1516,6 +1516,18 @@ done:
     llama_memory_clear(mem, true);
     llama_synchronize(ctx);
 
+    // INSTRUMENT: which rollback path this context resolved to decides whether every drafting step
+    // pays a checkpoint save plus a re-decode of the accepted tokens (FULL) or just drops the
+    // rejected suffix (RS). Both branches above only say so at TRACE, so the single most
+    // load-bearing fact about speculation cost is invisible in a normal run. Called once at init,
+    // never in the hot path. No new locals: the gotos above jump over this scope.
+    COM_INF("context seq_rm type = %s (n_rs_seq = %u)\n",
+            res == COMMON_CONTEXT_SEQ_RM_TYPE_NO   ? "NO"   :
+            res == COMMON_CONTEXT_SEQ_RM_TYPE_PART ? "PART" :
+            res == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ? "FULL" :
+            res == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ? "RS"   : "UNKNOWN",
+            llama_n_rs_seq(ctx));
+
     return res;
 }
 

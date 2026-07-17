@@ -14,6 +14,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
@@ -390,7 +391,61 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        // EXPERIMENT (env-gated, default OFF = shipped behaviour bit-for-bit).
+        //
+        // The list above enumerates only the draft-MODEL types, but n_rs_seq has nothing to do with
+        // owning a draft model: it oversizes the recurrent-state ring so that the last n_rs_seq
+        // positions stay removable, which is what lets seq_rm() drop a REJECTED draft suffix. Any
+        // method that proposes k tokens ahead needs that rollback. ngram-mod proposes up to
+        // ngram_mod.n_max, so it needs it exactly as much as MTP does, yet it is absent here.
+        //
+        // Consequence when absent: n_rs_seq stays 0, llama_kv_cache_dsv4::seq_rm() refuses the
+        // partial removal, common_context_seq_rm_type falls back to FULL, and the server then pays
+        // per drafting step a checkpoint save plus, on partial acceptance, a restore AND a
+        // re-decode of the accepted tokens. The draft-model types never pay this.
+        //
+        // Note common_speculative_n_max() (speculative.cpp) already classifies every type
+        // correctly, ngram included. It cannot be called from here (speculative.h includes
+        // common.h, not the reverse), so this predicate hand-duplicates a subset of that same
+        // logic - which is precisely how the ngram types came to be missing from one copy and
+        // present in the other.
+        uint32_t n = needs_rs_seq ? (uint32_t) std::max(0, draft.n_max) : 0u;
+
+        if (getenv("LLAMA_SPEC_NGRAM_RS")) {
+            for (const auto t : types) {
+                if (t == COMMON_SPECULATIVE_TYPE_NGRAM_MOD) {
+                    n = std::max(n, (uint32_t) std::max(0, ngram_mod.n_max));
+                }
+            }
+        }
+
+        // EXPERIMENT SCAFFOLDING ONLY (never a shipping knob; both env vars unset = shipped path).
+        //
+        // n_rs_seq oversizes the compressed rings by n_rs_seq ROWS, so it is part of the KV
+        // GEOMETRY. Two consequences that a width sweep runs straight into:
+        //
+        //  1. A slot saved under one n_rs_seq cannot be restored under another - the loader
+        //     rejects it with "DSV4 compressor state metadata mismatch". Since n_rs_seq above is
+        //     derived from ngram_mod.n_max, sweeping n_max would silently change the geometry at
+        //     every leg, so every leg would need its OWN 40-minute prefill to build its own slot.
+        //
+        //  2. Worse, the geometry would then be a second variable moving WITH the width, and the
+        //     sweep exists to attribute a cost curve to width alone.
+        //
+        // Pinning n_rs_seq decouples the two: the ring geometry is identical at every leg (so one
+        // slot serves all of them) and n_max is the only thing that moves. Set the pin >= the
+        // widest leg and no leg ever crosses the draft.size() > n_rs_seq threshold that would
+        // reintroduce checkpoints. Deliberately applied OUTSIDE the type loop, so a no-speculation
+        // baseline leg gets the same geometry too - which both keeps it slot-compatible and prices
+        // the oversizing itself (pinned baseline vs unpinned baseline = the cost of the rings).
+        if (const char * pin = getenv("LLAMA_SPEC_NGRAM_RS_PIN")) {
+            const int v = atoi(pin);
+            if (v > 0) {
+                n = std::max(n, (uint32_t) v);
+            }
+        }
+
+        return n;
     }
 };
 
