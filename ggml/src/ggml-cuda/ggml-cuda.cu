@@ -1,4 +1,5 @@
 #include "ggml-cuda.h"
+#include <set>
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -2439,6 +2440,31 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             }
         }
 
+        // [TAG_TOP_K_HIP_CUDA_GRAPHS]
+        // top-k routes through hipCUB on HIP (see top-k.cu), which allocates its keys/indices/
+        // temp_storage from the CUDA pool inside the op. Devices that report VMM=no fall back to
+        // ggml_cuda_pool_leg, whose alloc() ends in cudaMalloc when no pooled block fits -- and
+        // allocating during stream capture is illegal, which takes the HIP runtime into unbounded
+        // recursion rather than a clean error. Normal inference never hits it (the eager warmup
+        // sizes the pool before the first capture, replays never allocate, and the pool's 5%
+        // look-ahead absorbs the slow growth of n_lid), but capturing on a cold pool does --
+        // test-backend-ops `perf -o TOP_K` reproduces it every time.
+        //
+        // Disabling graphs for these cgraphs is measured perf-NEUTRAL for DeepSeek-V4-Flash on
+        // gfx1151: tg64 13.07 -> 13.23 at d0, 8.51 -> 8.57 at 176k, i.e. graphs were worth ~-1%.
+        // That evidence is from ONE VMM=no device and is not claimed to generalise; on a VMM=yes
+        // AMD device the leg-pool path cannot trigger and graphs may well pay. The guard is kept
+        // unconditional anyway because the untestable-config trade is asymmetric: the worst case
+        // here is ~1% slower, the worst case without it is a crash.
+#if defined(GGML_USE_HIP)
+        if (node->op == GGML_OP_TOP_K) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to top-k (hipCUB pool alloc vs capture)\n", __func__);
+#endif
+        }
+#endif  // GGML_USE_HIP
+
         if (!use_cuda_graph) {
             break;
         }
@@ -4002,10 +4028,42 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// [TAG_OP_CENSUS] GGML_OP_CENSUS=1: histogram the ops actually submitted, once per distinct node count.
+// Reports the graph, not the kernels: 6386 launches/tok is a NODE-count problem, and kernel names alone
+// cannot say which builder emitted them. One-shot per shape -- GGML_SCHED_DEBUG=2 prints every node on
+// every compute, which at this node count writes faster than the GPU computes (7 GB in ~2 min).
+static void ggml_cuda_op_census(ggml_cgraph * cgraph) {
+    static std::set<int> seen;
+    if (!seen.insert(cgraph->n_nodes).second) {
+        return;
+    }
+    std::map<int, int> hist;
+    int n_real = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_cuda_is_view_or_noop(node)) {
+            continue;
+        }
+        hist[(int) node->op]++;
+        n_real++;
+    }
+    fprintf(stderr, "[OP_CENSUS] n_nodes=%d submitted=%d (views/noops skipped=%d)\n",
+            cgraph->n_nodes, n_real, cgraph->n_nodes - n_real);
+    std::vector<std::pair<int,int>> v(hist.begin(), hist.end());
+    std::sort(v.begin(), v.end(), [](auto & a, auto & b) { return a.second > b.second; });
+    for (const auto & e : v) {
+        fprintf(stderr, "[OP_CENSUS]   %5d  %s\n", e.second, ggml_op_name((ggml_op) e.first));
+    }
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    if (getenv("GGML_OP_CENSUS")) {
+        ggml_cuda_op_census(cgraph);
+    }
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -4953,6 +5011,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SUM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_TOP_K:
+            // on HIP, top-k routes through hipCUB (see top-k.cu) and handles any width; without
+            // it the ne[0] > 1024 cases fall back to the CPU, which is ruinous for DeepSeek DSA
+            // models that run one wide TOP_K per layer per token.
+#if defined(GGML_USE_HIP)
+            {
+                // measurement gate: DSV4_NO_GPU_TOPK=1 restores the pre-fix CPU fallback, so both
+                // legs of the A/B come from one binary instead of comparing across builds
+                static const bool no_gpu_topk = getenv("DSV4_NO_GPU_TOPK") != nullptr;
+                if (no_gpu_topk) {
+                    return op->src[0]->ne[0] <= 1024;
+                }
+            }
+            return true;
+#elif defined(GGML_CUDA_USE_CUB)
+            return true;
+#else
+            return op->src[0]->ne[0] <= 1024;
+#endif
         case GGML_OP_ARGSORT:
 #ifndef GGML_CUDA_USE_CUB
             return op->src[0]->ne[0] <= 1024;

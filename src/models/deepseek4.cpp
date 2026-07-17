@@ -1,3 +1,5 @@
+#include <set>
+#include <tuple>
 #include "models.h"
 
 #include "llama-kv-cache-dsv4.h"
@@ -693,13 +695,223 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
             csa_k->nb[1], csa_k->nb[2], csa_k->nb[3], 0);
     cb(csa_k, "csa_comp_k", il);
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
-    cb(k_all, "csa_k_all", il);
-
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
-    ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
 
-    ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
+    // [DSV4_FA_COMPACT] FA has no mask-aware row skip: it pays for all n_csa+n_raw rows even
+    // though only n_top_k+n_raw of them are unmasked. At decode (nt == 1) we can gather just the
+    // selected rows into a small dense operand instead of masking, so FA runs over ~n_top_k+n_raw
+    // rows instead of n_csa+n_raw. Building the top-k mask (build_top_k_mask) is skipped entirely
+    // on this path -- it exists to make invisible rows in the full-width operand -inf, which is
+    // moot once the operand only contains the rows we kept.
+    static const bool fa_compact          = getenv("DSV4_FA_COMPACT") != nullptr;
+    // [DSV4_FA_COMPACT_IDENTITY] control leg for byte-exactness: same gather machinery, but with
+    // identity indices 0..n_csa-1 instead of the real top-k, so the operand is [csa; raw] in
+    // natural row order -- the same content/order as DSV4_CONCAT_REORDER. Lets the box owner
+    // sha-compare COMPACT_IDENTITY against CONCAT_REORDER to prove the gather itself is correct,
+    // independent of whether the top-k selection is correct.
+    static const bool fa_compact_identity = getenv("DSV4_FA_COMPACT_IDENTITY") != nullptr;
+
+    // [DSV4_ABLATE_CONCAT] see below (measurement-only leg): declared here so it can also gate the
+    // compact path -- ablate takes priority over compact, compact takes priority over mirror/concat.
+    static const bool ablate_concat = getenv("DSV4_ABLATE_CONCAT") != nullptr;
+
+    const int64_t nt = cur->ne[1];
+    const int64_t n_stream_csa = csa_k->ne[3];
+
+    // Compact path requires single-token decode (nt == 1) and single stream: the gather machinery
+    // below assumes both, and this box only ever runs single-stream. Anything else falls back to
+    // the existing mirror/concat legs below rather than guessing at multi-stream indexing.
+    const bool compact_eligible = (fa_compact || fa_compact_identity) && nt == 1 && n_stream_csa == 1;
+    const bool use_compact      = compact_eligible && !ablate_concat;
+
+    ggml_tensor * csa_mask = nullptr;
+    int64_t n_csa_compact_rows = 0;
+
+    if (use_compact) {
+        ggml_tensor * idx;
+        int64_t n_rows;
+
+        if (fa_compact_identity) {
+            // Identity indices 0..n_csa-1: gathers every csa row in natural order, so the operand
+            // matches DSV4_CONCAT_REORDER's [csa; raw] byte-for-byte -- this leg is a correctness
+            // control, not a speed path.
+            ggml_tensor * ar = ggml_arange(ctx0, 0.0f, (float) n_csa, 1.0f);
+            idx = ggml_cast(ctx0, ar, GGML_TYPE_I32);
+            idx = ggml_reshape_4d(ctx0, idx, n_csa, 1, 1, 1);
+            n_rows = n_csa;
+        } else {
+            // top_k is [n_top_k, nt, 1, n_stream] (ggml_cont'd in build_lid_top_k); since nt == 1
+            // and n_stream == 1 here, reshaping to [n_top_k, 1, n_stream, 1] is just a relabeling
+            // of the same contiguous buffer -- this is the row-index operand ggml_get_rows wants.
+            idx = ggml_reshape_4d(ctx0, top_k, top_k->ne[0], 1, top_k->ne[3], 1);
+            n_rows = top_k->ne[0];
+        }
+        cb(idx, "csa_compact_idx", il);
+
+        // csa_k is [n_embd, n_head_kv(=1), n_csa, n_stream] (rows on ne[2]). ggml_get_rows gathers
+        // along ne[1], so reinterpret with n_csa moved to ne[1] and the size-1 head dim to ne[2].
+        // This is a strided VIEW, not a copy: ggml_get_rows only requires nb[0] == type_size (the
+        // CUDA kernel indexes rows via nb01/nb02/nb03 directly), so the gather reads straight out
+        // of the cache's strided storage. Do not ggml_cont() this -- a full-width cont here is
+        // exactly the copy this whole change exists to eliminate.
+        GGML_ASSERT(csa_k->nb[0] == ggml_type_size(csa_k->type));
+        ggml_tensor * csa_k_rows = ggml_view_4d(ctx0, csa_k,
+                csa_k->ne[0], n_csa, csa_k->ne[1], csa_k->ne[3],
+                csa_k->nb[2], csa_k->nb[1], csa_k->nb[3], 0);
+
+        // get_rows has no F16 output path, so the small (n_rows-row) result comes back F32; cast
+        // it back to F16 to concat with raw_k. The f16->f32->f16 roundtrip is exact.
+        ggml_tensor * csa_sel = ggml_get_rows(ctx0, csa_k_rows, idx);
+        csa_sel = ggml_reshape_4d(ctx0, csa_sel, csa_k->ne[0], csa_k->ne[1], n_rows, n_stream_csa);
+        csa_sel = ggml_cast(ctx0, csa_sel, csa_k->type);
+        cb(csa_sel, "csa_compact_k", il);
+
+        if (fa_compact_identity) {
+            // Identity leg: the operand is ALL n_csa rows in natural order, so the mask must be the
+            // SAME full-width top-k mask CONCAT_REORDER uses -- operand and mask both identical,
+            // leaving the gather machinery as the only variable. Gathering the base mask here would
+            // attend every visible row (top-k selection off) and sha(GI) could never match sha(R).
+            csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+        } else {
+            // Gather the BASE mask (not the top-k mask) at the same indices: any top_k index that
+            // points at an invisible row (n_visible < n_top_k padding) still carries its -inf, so
+            // the compact operand does not need its own top-k mask built.
+            ggml_tensor * mask_rows = ggml_view_4d(ctx0, inp_csa.kq_mask,
+                    1, inp_csa.kq_mask->ne[0], inp_csa.kq_mask->ne[1], inp_csa.kq_mask->ne[3],
+                    inp_csa.kq_mask->nb[0], inp_csa.kq_mask->nb[1], inp_csa.kq_mask->nb[2], 0);
+            ggml_tensor * mask_sel = ggml_get_rows(ctx0, mask_rows, idx);
+            mask_sel = ggml_reshape_4d(ctx0, mask_sel, n_rows, 1, 1, n_stream_csa);
+            csa_mask = ggml_cast(ctx0, mask_sel, cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32);
+            cb(csa_mask, "csa_compact_mask", il);
+        }
+
+        csa_k  = csa_sel;
+        n_csa_compact_rows = n_rows;
+    } else {
+        // Every non-compact leg (ablate/mirror/concat/concat_reorder) still needs the full-width
+        // top-k mask; only the compact operand skips it.
+        csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+    }
+
+    // [DSV4_LOG_SHAPES] geometry dump: the concat's operand sizes decide whether co-allocating
+    // raw+comp into one buffer is worth its memory, so measure them instead of inferring from
+    // bandwidth. Fires once per layer per graph build; graph builds are rare (cgraph reuse).
+    if (getenv("DSV4_LOG_SHAPES")) {
+        fprintf(stderr, "[dsv4-shapes] il=%2d CSA  raw_k=[%lld,%lld,%lld] cap=%lld  csa_k=[%lld,%lld,%lld] cap_used=%lld  row=%zu B  concat_MB=%.1f\n",
+                il,
+                (long long) raw_k->ne[0], (long long) raw_k->ne[1], (long long) raw_k->ne[2],
+                (long long) raw_k->ne[2],
+                (long long) csa_k->ne[0], (long long) csa_k->ne[1], (long long) n_csa,
+                (long long) n_csa,
+                ggml_row_size(raw_k->type, raw_k->ne[0]*raw_k->ne[1]),
+                (raw_k->ne[2] + n_csa) * ggml_row_size(raw_k->type, raw_k->ne[0]*raw_k->ne[1]) / 1048576.0);
+    }
+
+    ggml_tensor * k_all;
+    ggml_tensor * kq_mask;
+
+    // [DSV4_ABLATE_CONCAT] MEASUREMENT ONLY -- PRODUCES WRONG OUTPUT ON PURPOSE.
+    // Drops the raw window and attends over the compressed cache alone, which removes the
+    // concat_cont<f16,2> copy (profiled at 11.4 ms/token = ~10% of decode @176k, 41 calls/token).
+    // This is a SPEED CEILING for "make k_all a view instead of a copy", not a working config:
+    // it also removes the raw window's attention work, so the true prize is <= what this shows.
+    // Never leave this set; never quote a number from it as a result.
+    // (declared earlier, alongside the compact gates, since it also has to gate use_compact)
+
+    // [TAG_DSV4_RAW_MIRROR] Preferred path: mirror the raw window into the CSA cache's over-allocated
+    // tail and view both halves as one operand, instead of ggml_concat copying all 54528 rows every
+    // token. Copies 2304 rows instead -- ~4% of the traffic for the same operand.
+    // Requires the compressed operand to be exactly the cache's logical size, since that is where the
+    // tail (and hence the raw half) begins; anything else means the view would not line up with the
+    // mask, so fall back to the concat rather than guess.
+    auto * mctx_csa = inp_dsv4->mctx->get_csa();
+
+    const uint32_t n_raw    = (uint32_t) raw_k->ne[2];
+    const uint32_t n_mirror = mctx_csa->get_n_mirror(il);
+
+    // Escape hatch + the A leg of the A/B: forces the concat path with the mirror compiled in, so the
+    // two legs differ by exactly one variable.
+    static const bool no_mirror = getenv("DSV4_NO_RAW_MIRROR") != nullptr;
+    // [CONTROL C] Pure ggml_concat, but in the MIRROR's row order [csa; raw] instead of [raw; csa].
+    // Keeps the full copy (no perf win) and changes ONLY the row order. This is the correctness gate:
+    // sha(C) == sha(B) proves the mirror wrote byte-identical data and that the permutation is the sole
+    // variable. sha equality against A is unachievable by construction here -- FA's tile-order reduction
+    // is not permutation-invariant in floating point -- so "fluent output that reconverges" proves
+    // nothing: a single wrong row produces that same signature.
+    static const bool concat_reorder = getenv("DSV4_CONCAT_REORDER") != nullptr;
+
+    // The mirror lands at row n_csa, which is where the compressed operand ends in THIS graph, so it
+    // works at any depth. An earlier version demanded n_csa == get_n_kv() (i.e. a full-capacity
+    // compressed block, since the tail was pinned to the cache's logical end); that holds only in the
+    // RESERVE graph, so every decode graph silently fell back to concat and the whole thing measured
+    // as +0.16% -- concat vs concat. Room is the only real precondition now.
+    const bool use_mirror = !ablate_concat && !use_compact && !concat_reorder && !no_mirror && n_mirror >= n_raw &&
+                            (uint64_t) n_csa + n_raw <= (uint64_t) mctx_csa->get_n_kv() + n_mirror;
+
+    // One-shot, straight to stderr: LLAMA_LOG_* does not reach the server log on this build, and an
+    // identical sha between the two legs is NOT evidence the mirror ran -- if use_mirror is false, B
+    // silently falls back to the same concat as A and the legs are trivially identical. This print is
+    // what distinguishes "the mirror is correct" from "we compared concat against concat".
+    // PER-LAYER, once each: a single global print only proves ONE layer took the branch. The kernel
+    // trace showed concat_cont still at 41 calls/token (= every layer) while the global print said
+    // MIRROR -- exactly the ambiguity a one-shot print cannot resolve.
+    // Count EVERY decision and print periodically. A first-time-per-layer print only ever reports the
+    // RESERVE graph (built once at context creation, worst-case shapes) and is then silent for every
+    // decode graph -- which is exactly how "path=MIRROR on all 21 layers" coexisted with concat_cont
+    // still firing 41x/token and the mirror's cpy kernel absent from the trace.
+    // Report every DISTINCT (n_csa, n_raw, path) once. Counting decisions was the wrong instrument
+    // twice over: a decision is a graph BUILD, and the decode graph is built once then reused, so a
+    // modulo-N print reports only the earliest builds (reserve, at capacity) and never names the shape
+    // decode actually executes. A distinct-shape set covers every shape exactly once, spam-free.
+    {
+        static std::set<std::tuple<long long, unsigned, int>> seen;
+        const int path = ablate_concat ? 2 :
+                         use_compact   ? (fa_compact_identity ? 5 : 4) :
+                         use_mirror    ? 1 :
+                         concat_reorder ? 3 : 0;
+        if (seen.insert(std::make_tuple((long long) n_csa, n_raw, path)).second) {
+            if (path == 4 || path == 5) {
+                fprintf(stderr, "[DSV4_MIRROR] shape n_csa=%lld n_raw=%u n_top_k=%lld -> path=%s  (comp_n_kv=%u n_mirror=%u kv_size=%u il=%d)\n",
+                        (long long) n_csa, n_raw, (long long) n_csa_compact_rows,
+                        path == 4 ? "COMPACT" : "COMPACT_IDENTITY",
+                        mctx_csa->get_n_kv(), n_mirror, mctx_csa->get_n_kv(), il);
+            } else {
+                fprintf(stderr, "[DSV4_MIRROR] shape n_csa=%lld n_raw=%u -> path=%s  (comp_n_kv=%u n_mirror=%u kv_size=%u il=%d)\n",
+                        (long long) n_csa, n_raw,
+                        path == 1 ? "MIRROR" : path == 2 ? "ABLATE" : path == 3 ? "CONCAT_REORDER" : "CONCAT",
+                        mctx_csa->get_n_kv(), n_mirror, mctx_csa->get_n_kv(), il);
+            }
+        }
+    }
+
+    if (ablate_concat) {
+        k_all   = csa_k;
+        kq_mask = csa_mask;
+    } else if (use_compact) {
+        // csa_k/csa_mask are already the small gathered (n_top_k- or n_csa-row) operands here; the
+        // concat is cheap because the compressed side no longer has 44032 rows to copy.
+        k_all   = ggml_concat(ctx0, csa_k, raw_k, 2);
+        kq_mask = ggml_concat(ctx0, csa_mask, raw_mask, 0);
+    } else if (use_mirror) {
+        // Ordering is by graph insertion: the copy must be expanded before the attention op reads it.
+        ggml_build_forward_expand(gf, mctx_csa->mirror_raw_k(ctx0, raw_k, il, (uint32_t) n_csa));
+
+        k_all = mctx_csa->get_k_all(ctx0, n_raw, il, (uint32_t) n_csa);
+
+        // A non-contiguous K makes the backend insert a full-height cont, i.e. exactly the copy we came
+        // here to delete. Catch that at graph-build time rather than reading it back out of a profile.
+        GGML_ASSERT(ggml_is_contiguous(k_all) && "mirror k_all must be contiguous or FA will re-copy it");
+
+        // Mask order follows the operand: compressed rows first, raw window second.
+        kq_mask = ggml_concat(ctx0, csa_mask, raw_mask, 0);
+    } else if (concat_reorder) {
+        k_all   = ggml_concat(ctx0, csa_k, raw_k, 2);
+        kq_mask = ggml_concat(ctx0, csa_mask, raw_mask, 0);
+    } else {
+        k_all   = ggml_concat(ctx0, raw_k, csa_k, 2);
+        kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
+    }
+    cb(k_all, "csa_k_all", il);
     cb(kq_mask, "csa_lid_kq_mask", il);
 
     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
@@ -748,13 +960,34 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
             hca_k->nb[1], hca_k->nb[2], hca_k->nb[3], 0);
     cb(hca_k, "hca_comp_k", il);
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, hca_k, 2);
-    cb(k_all, "hca_k_all", il);
-
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
     ggml_tensor * hca_mask = inp_hca.kq_mask;
 
-    ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, hca_mask, 0);
+    // [DSV4_LOG_SHAPES] see build_csa_lid_attention.
+    if (getenv("DSV4_LOG_SHAPES")) {
+        fprintf(stderr, "[dsv4-shapes] il=%2d HCA  raw_k=[%lld,%lld,%lld] cap=%lld  hca_k=[%lld,%lld,%lld] cap_used=%lld  row=%zu B  concat_MB=%.1f\n",
+                il,
+                (long long) raw_k->ne[0], (long long) raw_k->ne[1], (long long) raw_k->ne[2],
+                (long long) raw_k->ne[2],
+                (long long) hca_k->ne[0], (long long) hca_k->ne[1], (long long) n_hca,
+                (long long) n_hca,
+                ggml_row_size(raw_k->type, raw_k->ne[0]*raw_k->ne[1]),
+                (raw_k->ne[2] + n_hca) * ggml_row_size(raw_k->type, raw_k->ne[0]*raw_k->ne[1]) / 1048576.0);
+    }
+
+    ggml_tensor * k_all;
+    ggml_tensor * kq_mask;
+
+    // [DSV4_ABLATE_CONCAT] see build_csa_lid_attention -- measurement only, wrong output on purpose.
+    static const bool ablate_concat = getenv("DSV4_ABLATE_CONCAT") != nullptr;
+    if (ablate_concat) {
+        k_all   = hca_k;
+        kq_mask = hca_mask;
+    } else {
+        k_all   = ggml_concat(ctx0, raw_k, hca_k, 2);
+        kq_mask = ggml_concat(ctx0, raw_mask, hca_mask, 0);
+    }
+    cb(k_all, "hca_k_all", il);
     cb(kq_mask, "hca_kq_mask", il);
 
     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, kq_scale, il);

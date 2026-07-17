@@ -1040,13 +1040,26 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     const bool unified_compressed = false;
 
-    LLAMA_LOG_INFO("%s: creating DSV4 CSA compressed KV cache, size = %u cells\n",
-            __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
+    // [TAG_DSV4_RAW_MIRROR] Over-allocate the CSA cache by one raw window so CSA attention can view
+    // raw ++ compressed K in place instead of concatenating them every token (see get_k_all()).
+    // Only CSA: for HCA the compressed side is 1792 rows against a 2304-row raw window, so the copy
+    // it would save is ~0.14 ms across all 20 layers -- not worth a second code path. HCA keeps the
+    // concat.
+    //
+    // Disabled unless single-stream (the extra rows break the stream stride, which assumes
+    // rows == kv_size) and unless the raw window is actually a window (swa_full makes it as large
+    // as the full cache, so mirroring it would cost as much as the concat it replaces).
+    // 0 => the graph falls back to concat, so this is a pure optimisation gate, not a correctness one.
+    const uint32_t n_raw_window = kv_raw->get_swa()->get_size();
+    const uint32_t n_csa_mirror = (n_seq_max == 1 && !swa_full) ? n_raw_window : 0;
+
+    LLAMA_LOG_INFO("%s: creating DSV4 CSA compressed KV cache, size = %u cells (+%u raw-mirror rows)\n",
+            __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO), n_csa_mirror);
 
     kv_csa = std::make_unique<llama_kv_cache>(
             model, hparams_csa, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, n_csa_mirror);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_HCA_RATIO));
@@ -1645,6 +1658,12 @@ llama_kv_cache_dsv4_comp_context::llama_kv_cache_dsv4_comp_context(
     kv(kv),
     sinfos(std::move(sinfos)),
     ubatches(std::move(ubatches)),
+    // NOTE: n_kv is the full allocated capacity ON PURPOSE -- do not "fix" this to the used-and-padded
+    // count the way the raw context and upstream llama_kv_cache_context::next() do. Tried and reverted
+    // 2026-07-16: the compressed cache never marks its cells used (it writes via explicit idxs from
+    // the comp plan and lets the MASK carry visibility), so cells.used_max_p1() is 0 and
+    // kv->get_n_kv(sinfo) returns 256 -- the padding floor, MEASURED, not inferred. Adopting it would
+    // silently truncate CSA attention from 52224 rows to 256. The c/4 operand width is structural.
     n_kv(kv->get_size()) {
 }
 
@@ -1670,6 +1689,69 @@ ggml_tensor * llama_kv_cache_dsv4_comp_context::get_k(ggml_context * ctx, int32_
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+}
+
+uint32_t llama_kv_cache_dsv4_comp_context::get_n_mirror(int32_t il) const {
+    // The tail is whatever the cache allocated past its logical size -- self-describing, so the
+    // mirror capacity never has to be plumbed through separately.
+    return (uint32_t) kv->get_k_storage(il)->ne[1] - kv->get_size();
+}
+
+// Rows [n_csa, n_csa + n_raw) of the compressed K are free real estate for the lifetime of a graph,
+// and that is what makes this work at decode. The comp plan writes cells at `pos/ratio`, which is
+// < n_visible <= plan.n_kv == n_csa; and dsv4_can_reuse_kq_mask() requires kq_mask->ne[0] == plan.n_kv,
+// so the instant n_csa would grow the graph is rebuilt rather than reused. A reused graph therefore
+// never writes at or above its own n_csa, and the mirror cannot collide with a live cell.
+//
+// Do NOT pin this to kv_size instead (the original design): at decode the compressed operand is
+// DEPTH-sized (n_csa = 44032 @176k), not capacity (52224), so a kv_size-pinned tail sits past an
+// 8192-row gap -- unreachable without widening the operand to capacity and paying FA for 8192 masked
+// rows that nothing skips (KV_max is a trailing bound only). Offsetting at n_csa keeps the operand at
+// n_csa + n_raw == exactly what the concat produced, so FA cost is unchanged and only the copy dies.
+void llama_kv_cache_dsv4_comp_context::assert_mirror_room(uint32_t n_csa, uint32_t n_raw, int32_t il) const {
+    GGML_ASSERT((uint64_t) n_csa + n_raw <= (uint64_t) kv->get_size() + get_n_mirror(il));
+}
+
+ggml_tensor * llama_kv_cache_dsv4_comp_context::mirror_raw_k(ggml_context * ctx, ggml_tensor * raw_k, int32_t il, uint32_t n_csa) const {
+    ggml_tensor * k = kv->get_k_storage(il);
+
+    const int64_t n_embd_k_gqa = k->ne[0];
+    const int64_t n_raw        = raw_k->ne[2];
+
+    // raw and compressed rows must be byte-identical in layout, else they cannot share an operand.
+    GGML_ASSERT(raw_k->ne[0]*raw_k->ne[1] == n_embd_k_gqa);
+    GGML_ASSERT(raw_k->type == k->type);
+    GGML_ASSERT(raw_k->ne[3] == 1);
+    GGML_ASSERT(n_raw > 0);
+    assert_mirror_room(n_csa, (uint32_t) n_raw, il);
+
+    // Merge the head dims so both sides are plain [n_embd_k_gqa, n_rows] row blocks -- the same
+    // flattening llama_kv_cache::cpy_k does on its k_cur.
+    ggml_tensor * src = ggml_view_2d(ctx, raw_k, n_embd_k_gqa, n_raw, raw_k->nb[2], 0);
+    ggml_tensor * dst = ggml_view_2d(ctx, k,     n_embd_k_gqa, n_raw, k->nb[1],     (size_t) n_csa*k->nb[1]);
+
+    return ggml_cpy(ctx, src, dst);
+}
+
+ggml_tensor * llama_kv_cache_dsv4_comp_context::get_k_all(ggml_context * ctx, uint32_t n_raw, int32_t il, uint32_t n_csa) const {
+    assert_mirror_room(n_csa, n_raw, il);
+    // The mirror gate requires a single stream, so the view starts at row 0 of stream 0.
+    GGML_ASSERT(sinfos[i_cur].s0 == 0 && sinfos[i_cur].s1 == 0);
+
+    // Do NOT build this by calling get_k(n_kv + n_raw): get_k hardcodes nb[3] off get_size(), so a view
+    // spanning the mirror tail gets nb[3] != nb[2]*ne[2] and ggml_is_contiguous() reports FALSE (it does
+    // not special-case ne[3] == 1). The old operand was ggml_concat's output, which was contiguous, so
+    // FA never had to care; feeding it a non-contiguous K instead makes the backend insert a full
+    // n_kv+n_raw row `cont` -- resurrecting the exact copy this whole change deletes, under another name.
+    // ne[3] == 1 here, so nb[3] describes no real stride and we are free to state the honest one.
+    ggml_tensor * k = kv->get_k_storage(il);
+
+    ggml_tensor * ref = kv->get_k(ctx, il, n_kv, sinfos[i_cur]); // head geometry, straight from hparams
+    const int64_t n_rows = (int64_t) n_csa + n_raw;
+
+    return ggml_view_4d(ctx, k,
+            ref->ne[0], ref->ne[1], n_rows, 1,
+            ref->nb[1], ref->nb[2], ref->nb[2]*n_rows, 0);
 }
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::build_input_k_rot(ggml_context * ctx) const {

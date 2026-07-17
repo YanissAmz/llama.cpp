@@ -244,6 +244,40 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 
+    // [TAG_DSV4_RAW_MIRROR] The attention operand is raw-K ++ compressed-K. Materialising that with
+    // ggml_concat re-copied the whole compressed cache every token (44032 rows @176k = 45 MB/layer,
+    // measured at 11.4 ms/token = 10.7% of decode @176k). Instead each token copies the raw window
+    // (2304 rows = 2.25 MB/layer) into the compressed cache's own rows at offset n_csa, so both
+    // halves are one contiguous buffer that get_k_all() views in place.
+    //
+    // The mirror lands at n_csa, NOT at the cache's logical end: at decode the compressed operand is
+    // depth-sized, so an end-pinned tail is unreachable past a multi-thousand-row gap. See the long
+    // note on assert_mirror_room() in the .cpp for why rows >= n_csa are guaranteed free, and why
+    // this ordering costs FA nothing. n_mirror extra rows are still allocated past the logical size
+    // for the one case that needs them: n_csa == kv_size, i.e. a full cache.
+    //
+    // The copy is WHOLESALE, not incremental, and that is what makes it safe: it depends on no
+    // history, so a slot restore / cache shift / defrag is simply picked up by the next token. An
+    // incremental mirror would instead go stale (state save/load excludes the tail rows) and heal
+    // only after 2304 tokens -- wrong output that fresh prefill never exposes.
+    //
+    // 0 when co-allocation is off (multi-seq or swa_full) -- callers must fall back to concat.
+    uint32_t get_n_mirror(int32_t il) const;
+
+    // Copy raw_k ([n_embd_head_k, n_head_kv, n_raw, 1]) into the mirror tail. Must be
+    // build_forward_expand'd BEFORE the attention op that reads get_k_all(): the dependency runs
+    // through the buffer, not the tensor graph, exactly like the existing cpy_k -> get_k pair on the
+    // raw cache. Do NOT try to force it with dsv4_with_zero_dep() -- that ggml_adds onto k_all and
+    // would materialise the 52224-row copy this whole change exists to delete.
+    ggml_tensor * mirror_raw_k(ggml_context * ctx, ggml_tensor * raw_k, int32_t il, uint32_t n_csa) const;
+
+    // View of [n_csa compressed rows | n_raw mirrored raw rows] as a single attention operand.
+    // NOTE the ordering: compressed FIRST, raw SECOND -- the mask must be concatenated to match.
+    ggml_tensor * get_k_all(ggml_context * ctx, uint32_t n_raw, int32_t il, uint32_t n_csa) const;
+
+    // n_csa + n_raw must fit in the K storage (kv_size + mirror tail).
+    void assert_mirror_room(uint32_t n_csa, uint32_t n_raw, int32_t il) const;
+
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     void set_input_k_rot(ggml_tensor * dst) const;
 

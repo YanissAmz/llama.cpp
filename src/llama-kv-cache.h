@@ -112,7 +112,13 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+        // [TAG_DSV4_EXTRA_ROWS] allocate n_extra_rows rows past kv_size in each K tensor, WITHOUT
+        // changing get_size()/n_kv/strides -- the cache is unaware of them and never writes there.
+        // The tail is private scratch for the owner (DSV4 co-locates a raw-K mirror there so
+        // attention can view raw+compressed as one contiguous operand instead of concatenating).
+        // Requires n_stream == 1: the stream stride math below assumes rows == kv_size.
+                     uint32_t   n_extra_rows = 0);
 
     ~llama_kv_cache() = default;
 
