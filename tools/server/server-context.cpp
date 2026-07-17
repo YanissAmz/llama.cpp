@@ -3003,12 +3003,24 @@ private:
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
 
                 if (use_ckpt_tgt) {
-                    //const int64_t t_start = ggml_time_us();
+                    // EXPERIMENT SCAFFOLDING ONLY, env-gated (DSV4_CKPT_TIME unset = shipped path).
+                    // Upstream left this exact timer commented out here. It is the number the n_rs_seq
+                    // work needs: RS wins precisely by SKIPPING this branch, and three separate
+                    // constant-cost-per-op models have now failed to predict the win at both DEFAULT
+                    // and width 32 (LEDGER 28.39). Measure the cost instead of fitting a coefficient
+                    // to it. Prints size and draft width because the implied cost/op HALVES between the
+                    // two legs, and draft width is the obvious suspect.
+                    const bool ckpt_t = getenv("DSV4_CKPT_TIME") != nullptr;
+                    const int64_t t_start = ckpt_t ? ggml_time_us() : 0;
 
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-                    //const int64_t t_total = ggml_time_us() - t_start;
-                    //printf("checkpoint total: %f ms\n", t_total / 1000.0);
+                    if (ckpt_t) {
+                        printf("[CKPT] save %8.3f ms  size=%8.3f MiB  draft=%3zu\n",
+                               (ggml_time_us() - t_start) / 1000.0,
+                               (double) ckpt.size() / 1024 / 1024, draft.size());
+                        fflush(stdout);
+                    }
 
                     SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
                             ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
@@ -3831,9 +3843,25 @@ private:
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
                         {
+                            // EXPERIMENT SCAFFOLDING ONLY, env-gated (see the matching save-side timer).
+                            // load and seq_rm are timed separately because the reload story assumes the
+                            // load dominates, and that assumption has never been checked.
+                            const bool ckpt_t = getenv("DSV4_CKPT_TIME") != nullptr;
+                            const int64_t t0 = ckpt_t ? ggml_time_us() : 0;
+
                             ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
+                            const int64_t t1 = ckpt_t ? ggml_time_us() : 0;
+
                             common_context_seq_rm(slot.ctx_tgt, slot.id, ckpt.pos_max + 1, -1);
+
+                            if (ckpt_t) {
+                                const int64_t t2 = ggml_time_us();
+                                printf("[CKPT] load %8.3f ms  seq_rm %8.3f ms  size=%8.3f MiB  rollback=%3u\n",
+                                       (t1 - t0) / 1000.0, (t2 - t1) / 1000.0,
+                                       (double) ckpt.size() / 1024 / 1024, n_rollback);
+                                fflush(stdout);
+                            }
                         }
 
                         if (slot.ctx_dft) {
