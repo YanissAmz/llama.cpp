@@ -137,6 +137,7 @@ enum llm_type {
     LLM_TYPE_235B_A22B,
     LLM_TYPE_300B_A47B, // Ernie MoE big
     LLM_TYPE_310B_A15B, // /MiMo-V2-Flash
+    LLM_TYPE_314B_A13B, // Motif-3
     LLM_TYPE_355B_A32B, // GLM-4.5
     LLM_TYPE_397B_A17B, // Qwen3.5
     LLM_TYPE_685B_A37B, // DeepSeek V3.2
@@ -482,6 +483,17 @@ struct llama_layer {
     struct ggml_tensor * indexer_comp_wgate = nullptr;
     struct ggml_tensor * indexer_comp_ape   = nullptr;
     struct ggml_tensor * indexer_comp_norm  = nullptr;
+
+    // motif3 (the output gate projection reuses wqkv_gate)
+    struct ggml_tensor * attn_lambda       = nullptr;
+    struct ggml_tensor * ffn_poly          = nullptr;
+    struct ggml_tensor * ffn_poly_b        = nullptr;
+    struct ggml_tensor * ffn_poly_exps     = nullptr;
+    struct ggml_tensor * ffn_poly_exps_b   = nullptr;
+    struct ggml_tensor * ffn_poly_shexp    = nullptr;
+    struct ggml_tensor * ffn_poly_shexp_b  = nullptr;
+    struct ggml_tensor * hc_attn_norm      = nullptr;
+    struct ggml_tensor * hc_ffn_norm       = nullptr;
 
     // cogvlm
     struct ggml_tensor * visexp_attn_wqkv = nullptr;

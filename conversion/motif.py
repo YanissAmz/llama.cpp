@@ -162,6 +162,8 @@ class Motif3Model(TextModel):
                 assert data_torch.shape[0] == n_head_kv * (qk_nope_head_dim + v_head_dim)
                 kv_b = data_torch.view(n_head_kv, qk_nope_head_dim + v_head_dim, data_torch.shape[-1])
                 k_b, v_b = torch.split(kv_b, [qk_nope_head_dim, v_head_dim], dim=1)
+                # unsplit copy for the decompressed (non-absorbed) attention path
+                yield f"blk.{bid}.attn_kv_b.weight", data_torch
                 yield f"blk.{bid}.attn_k_b.weight", k_b.transpose(1, 2).contiguous()
                 yield f"blk.{bid}.attn_v_b.weight", v_b.contiguous()
                 return
