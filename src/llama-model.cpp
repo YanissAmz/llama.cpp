@@ -2185,7 +2185,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                     }
 
-                    if ((arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_HY_V3) && hparams.n_layer_nextn > 0) {
+                    if ((arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_HY_V3 || arch == LLM_ARCH_MOTIF3) && hparams.n_layer_nextn > 0) {
                         if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                             filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                         } else {
@@ -2213,7 +2213,27 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
-                        if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+                        if (arch == LLM_ARCH_MOTIF3 && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                            // the Motif-3 NextN/MTP block is a single full-attention
+                            // layer: plain KV cache holding only the MTP layer(s)
+                            res = new llama_kv_cache(
+                                    *this,
+                                    hparams,
+                                    params.type_k,
+                                    params.type_v,
+                                    !cparams.flash_attn,
+                                    cparams.offload_kqv,
+                                    cparams.kv_unified,
+                                    cparams.n_ctx_seq,
+                                    cparams.n_seq_max,
+                                    1,
+                                    0,
+                                    LLAMA_SWA_TYPE_NONE,
+                                    nullptr,
+                                    filter,
+                                    reuse,
+                                    nullptr);
+                        } else if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
                             llama_memory_t mem_other = llama_get_memory(cparams.ctx_other);
 
                             share = [&](int32_t il) {

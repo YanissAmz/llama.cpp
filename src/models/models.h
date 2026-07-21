@@ -1135,6 +1135,18 @@ struct llama_model_motif3 : public llama_model_base {
                 int il) const;
     };
 
+    struct graph_mtp : public llm_graph_context {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
+
+        ggml_tensor * build_attention(
+                const llama_model & model,
+                llm_graph_input_attn_kv * inp_attn,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                float kq_scale,
+                int il) const;
+    };
+
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 

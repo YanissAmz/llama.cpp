@@ -82,8 +82,9 @@ void llama_model_motif3::load_arch_tensors(llama_model_loader &) {
 
         int flags = 0;
         if (i >= n_layer) {
-            // skip the NextN/MTP tensors (preserved in the GGUF but not used for now)
-            flags |= TENSOR_SKIP | TENSOR_NOT_REQUIRED;
+            // NextN/MTP block: loaded (for --spec-type draft-mtp) but optional,
+            // so trunk-only GGUFs keep working
+            flags |= TENSOR_NOT_REQUIRED;
         }
 
         layer.attn_norm     = create_tensor(tn(LLM_TENSOR_ATTN_NORM,     "weight", i), {n_embd}, flags);
@@ -114,7 +115,8 @@ void llama_model_motif3::load_arch_tensors(llama_model_loader &) {
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, flags);
 
-        const bool is_dense = (uint32_t) i < hparams.n_layer_dense_lead;
+        // the NextN/MTP block (i >= n_layer) uses a dense PolyNorm MLP, no experts
+        const bool is_dense = (uint32_t) i < hparams.n_layer_dense_lead || i >= n_layer;
         const int flags_dense = is_dense ? flags : flags | TENSOR_NOT_REQUIRED;
         const int flags_moe   = is_dense ? flags | TENSOR_NOT_REQUIRED : flags;
 
@@ -150,6 +152,9 @@ void llama_model_motif3::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_motif3::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        return std::make_unique<graph_mtp>(*this, params);
+    }
     return std::make_unique<graph>(*this, params);
 }
 
@@ -610,7 +615,7 @@ llama_model_motif3::graph::graph(const llama_model & model, const llm_graph_para
         cb(inpL, "l_out", il);
     }
 
-    if (inp_out_ids) {
+    if (cparams.embeddings_nextn_masked && inp_out_ids) {
         ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
         flat = ggml_get_rows(ctx0, flat, inp_out_ids);
         inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, n_outputs);
@@ -621,6 +626,266 @@ llama_model_motif3::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "hc_mean", -1);
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+
+    // post-final-norm hidden state: the MTP draft head consumes this directly
+    // (the Motif-3 MTP block has no hnorm, so the chained state is post-norm)
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
+
+    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
+// PolyNorm with shared {3}/{1} coefficients (MTP dense MLP)
+static ggml_tensor * motif3_poly_norm_flat(
+        ggml_context * ctx,
+        ggml_tensor  * x,
+        ggml_tensor  * w,
+        ggml_tensor  * b) {
+    GGML_ASSERT(w->ne[0] == 3);
+
+    auto coef = [&](int64_t j) {
+        return ggml_view_3d(ctx, w, 1, w->ne[1], w->ne[2], w->nb[1], w->nb[2], j*w->nb[0]);
+    };
+
+    ggml_tensor * x2 = ggml_sqr(ctx, x);
+    ggml_tensor * x3 = ggml_mul(ctx, x2, x);
+
+    ggml_tensor * cur = ggml_mul(ctx, ggml_rms_norm(ctx, x3, MOTIF3_POLY_EPS), coef(0));
+    cur = ggml_add(ctx, cur, ggml_mul(ctx, ggml_rms_norm(ctx, x2, MOTIF3_POLY_EPS), coef(1)));
+    cur = ggml_add(ctx, cur, ggml_mul(ctx, ggml_rms_norm(ctx, x,  MOTIF3_POLY_EPS), coef(2)));
+    cur = ggml_add(ctx, cur, b);
+
+    return cur;
+}
+
+// same differential MLA attention as the trunk, against the plain (non-iswa)
+// KV cache of the MTP draft context
+ggml_tensor * llama_model_motif3::graph_mtp::build_attention(
+        const llama_model & model,
+        llm_graph_input_attn_kv * inp_attn,
+        ggml_tensor * cur,
+        ggml_tensor * inp_pos,
+        float kq_scale,
+        int il) const {
+    const auto & layer = model.layers[il];
+
+    const int64_t n_embd_head_k       = hparams.n_embd_head_k();
+    const int64_t n_embd_head_v       = hparams.n_embd_head_v();
+    // per-layer hparams arrays are only filled for the trunk: the MTP block
+    // shares the uniform head layout of layer 0
+    const int64_t n_head_kv           = hparams.n_head_kv(0);
+    const int64_t n_embd_head_qk_rope = hparams.n_rot();
+    const int64_t n_embd_head_qk_nope = n_embd_head_k - n_embd_head_qk_rope;
+    const int64_t kv_lora_rank        = hparams.n_lora_kv;
+
+    const int64_t n_slots       = n_head / n_head_kv;
+    const int64_t n_noise_slots = hparams.n_noise_heads / n_head_kv;
+    const int64_t n_sig_slots   = n_slots - n_noise_slots;
+    const int64_t n_sig_heads   = n_head - hparams.n_noise_heads;
+    const int64_t nt            = cur->ne[1];
+
+    GGML_ASSERT(hparams.n_noise_heads % n_head_kv == 0);
+    GGML_ASSERT(n_noise_slots == 1 && "only one noise head per kv group is supported");
+
+    // q/gate shared low-rank projection
+    ggml_tensor * q_latent = build_lora_mm(layer.wq_a, cur);
+    q_latent = build_norm(q_latent, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+    cb(q_latent, "mtp_q_latent", il);
+
+    ggml_tensor * q = build_lora_mm(layer.wq_b, q_latent);
+    q = ggml_reshape_3d(ctx0, q, n_embd_head_k, n_head, nt);
+    cb(q, "mtp_q", il);
+
+    ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_qk_nope, n_head, nt,
+            ggml_row_size(q->type, n_embd_head_k),
+            ggml_row_size(q->type, n_embd_head_k)*n_head,
+            0);
+    ggml_tensor * q_pe = ggml_view_3d(ctx0, q, n_embd_head_qk_rope, n_head, nt,
+            ggml_row_size(q->type, n_embd_head_k),
+            ggml_row_size(q->type, n_embd_head_k)*n_head,
+            ggml_row_size(q->type, n_embd_head_qk_nope));
+    q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr, n_embd_head_qk_rope, rope_type, n_ctx_orig,
+            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    cb(q_pe, "mtp_q_pe", il);
+
+    ggml_tensor * Qcur = ggml_concat(ctx0, q_nope, q_pe, 0);
+    cb(Qcur, "mtp_Qcur", il);
+
+    // shared kv latent + shared rope key
+    ggml_tensor * kv_cmpr_pe = build_lora_mm(layer.wkv_a_mqa, cur);
+    cb(kv_cmpr_pe, "mtp_kv_cmpr_pe", il);
+
+    ggml_tensor * kv_cmpr = ggml_view_2d(ctx0, kv_cmpr_pe, kv_lora_rank, nt,
+            kv_cmpr_pe->nb[1], 0);
+    ggml_tensor * k_pe = ggml_view_3d(ctx0, kv_cmpr_pe, n_embd_head_qk_rope, 1, nt,
+            kv_cmpr_pe->nb[1], kv_cmpr_pe->nb[1],
+            ggml_row_size(kv_cmpr_pe->type, kv_lora_rank));
+
+    kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
+    cb(kv_cmpr, "mtp_kv_cmpr", il);
+
+    k_pe = ggml_rope_ext(ctx0, k_pe, inp_pos, nullptr, n_embd_head_qk_rope, rope_type, n_ctx_orig,
+            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    cb(k_pe, "mtp_k_pe", il);
+
+    // decompress k_nope and v for all kv heads
+    ggml_tensor * kv = ggml_mul_mat(ctx0, layer.wkv_b, kv_cmpr);
+    cb(kv, "mtp_kv", il);
+
+    ggml_tensor * k_nope = ggml_view_3d(ctx0, kv, n_embd_head_qk_nope, n_head_kv, nt,
+            ggml_row_size(kv->type, n_embd_head_qk_nope + n_embd_head_v),
+            ggml_row_size(kv->type, n_embd_head_qk_nope + n_embd_head_v)*n_head_kv,
+            0);
+    ggml_tensor * Vcur = ggml_view_3d(ctx0, kv, n_embd_head_v, n_head_kv, nt,
+            ggml_row_size(kv->type, n_embd_head_qk_nope + n_embd_head_v),
+            ggml_row_size(kv->type, n_embd_head_qk_nope + n_embd_head_v)*n_head_kv,
+            ggml_row_size(kv->type, n_embd_head_qk_nope));
+    Vcur = ggml_cont(ctx0, Vcur);
+    cb(Vcur, "mtp_Vcur", il);
+
+    ggml_tensor * k_pe_rep = ggml_repeat_4d(ctx0, ggml_cont(ctx0, k_pe),
+            n_embd_head_qk_rope, n_head_kv, nt, 1);
+    ggml_tensor * Kcur = ggml_concat(ctx0, k_nope, k_pe_rep, 0);
+    cb(Kcur, "mtp_Kcur", il);
+
+    ggml_tensor * attn = build_attn(inp_attn,
+            nullptr, nullptr, nullptr,
+            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    cb(attn, "mtp_attn_heads", il);
+
+    attn = ggml_reshape_4d(ctx0, attn, n_embd_head_v, n_slots, n_head_kv, nt);
+
+    ggml_tensor * signal = ggml_view_4d(ctx0, attn, n_embd_head_v, n_sig_slots, n_head_kv, nt,
+            attn->nb[1], attn->nb[2], attn->nb[3], 0);
+    ggml_tensor * noise = ggml_view_4d(ctx0, attn, n_embd_head_v, 1, n_head_kv, nt,
+            attn->nb[1], attn->nb[2], attn->nb[3], n_sig_slots*attn->nb[1]);
+    noise = ggml_cont(ctx0, noise);
+
+    // differential attention: signal - sigmoid(lambda(x)) * noise
+    ggml_tensor * lambda = build_lora_mm(layer.attn_lambda, cur);
+    lambda = ggml_sigmoid(ctx0, lambda);
+    lambda = ggml_reshape_4d(ctx0, lambda, 1, n_sig_slots, n_head_kv, nt);
+    cb(lambda, "mtp_attn_lambda", il);
+
+    ggml_tensor * noise_rep = ggml_repeat_4d(ctx0, noise, n_embd_head_v, n_sig_slots, n_head_kv, nt);
+    ggml_tensor * out = ggml_sub(ctx0, signal, ggml_mul(ctx0, noise_rep, lambda));
+    cb(out, "mtp_attn_diff", il);
+
+    // output gate from the shared q latent
+    ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, q_latent);
+    gate = ggml_sigmoid(ctx0, gate);
+    gate = ggml_reshape_4d(ctx0, gate, n_embd_head_v, n_sig_slots, n_head_kv, nt);
+    out = ggml_mul(ctx0, out, gate);
+    cb(out, "mtp_attn_gated", il);
+
+    out = ggml_cont_2d(ctx0, out, n_embd_head_v*n_sig_heads, nt);
+    out = build_lora_mm(layer.wo, out);
+    cb(out, "mtp_attn_out", il);
+
+    return out;
+}
+
+// LLM_GRAPH_TYPE_DECODER_MTP draft head for Motif-3.
+// No public reference forward exists for the MTP block; semantics follow the
+// DeepSeek-V3 NextN convention adapted to the tensors actually present:
+//   input_proj(concat(embed_norm(emb), h)) -> full Motif-3 decoder block
+//   (differential MLA attention + dense PolyNorm MLP, plain residual, no MHC)
+//   -> final_layernorm (stored as nextn.shared_head_norm) -> shared LM head.
+// The checkpoint has no hnorm: the chained hidden state is the trunk's
+// post-final-norm output, consumed as-is.
+llama_model_motif3::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
+    : llm_graph_context(params) {
+    GGML_ASSERT(hparams.n_layer_nextn > 0 && "MOTIF3 MTP requires n_layer_nextn > 0");
+
+    const int64_t n_embd_head_k = hparams.n_embd_head_k();
+
+    const int il = hparams.n_layer() + cparams.nextn_layer_offset;
+    GGML_ASSERT(cparams.nextn_layer_offset >= 0 &&
+                cparams.nextn_layer_offset < (int) hparams.n_layer_nextn &&
+                "nextn_layer_offset out of range [0, n_layer_nextn)");
+    const auto & layer = model.layers[il];
+
+    GGML_ASSERT(layer.nextn.eh_proj && "MTP block missing nextn.eh_proj");
+    GGML_ASSERT(layer.nextn.enorm   && "MTP block missing nextn.enorm");
+    GGML_ASSERT(layer.nextn.shared_head_norm && "MTP block missing nextn.shared_head_norm");
+    GGML_ASSERT(layer.ffn_gate && "MTP block missing dense ffn");
+
+    // same YaRN mscale correction as the trunk
+    GGML_ASSERT(ext_factor >= 0.0f);
+    const float attn_factor_org = attn_factor * (1.0f + 0.1f * logf(1.0f / freq_scale));
+    const float mscale   = attn_factor_org * (1.0f + 0.1f * hparams.rope_yarn_log_mul * logf(1.0f / freq_scale));
+    const float kq_scale = 1.0f * mscale * mscale / sqrtf(float(n_embd_head_k));
+
+    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
+
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->embd);
+    ggml_set_name(inp->embd, "mtp_h_input");
+
+    ggml_tensor * h_input  = inp->embd;
+    ggml_tensor * tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+    cb(tok_embd, "mtp_tok_embd", il);
+
+    res->add_input(std::move(inp));
+
+    ggml_tensor * inp_pos     = build_inp_pos();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    auto * inp_attn           = build_attn_inp_kv();
+
+    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    cb(e_norm, "mtp_enorm", il);
+
+    ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_input, /*dim=*/ 0);
+    cb(concat, "mtp_concat", il);
+
+    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat);
+    cb(cur, "mtp_eh_proj", il);
+
+    ggml_tensor * inpSA = cur;
+
+    cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_attn_norm", il);
+
+    cur = build_attention(model, inp_attn, cur, inp_pos, kq_scale, il);
+
+    ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+    cb(ffn_inp, "mtp_ffn_inp", il);
+
+    cur = build_norm(ffn_inp, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_ffn_norm", il);
+
+    {
+        ggml_tensor * gate = build_lora_mm(layer.ffn_gate, cur);
+        ggml_tensor * up   = build_lora_mm(layer.ffn_up,   cur);
+        gate = motif3_poly_norm_flat(ctx0, gate, layer.ffn_poly, layer.ffn_poly_b);
+        cur = ggml_mul(ctx0, gate, up);
+        cur = build_lora_mm(layer.ffn_down, cur);
+        cb(cur, "mtp_ffn_out", il);
+    }
+
+    cur = ggml_add(ctx0, cur, ffn_inp);
+    cb(cur, "mtp_out", il);
+
+    if (inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
+    // the MTP block's trailing final_layernorm (stored as shared_head_norm)
+    cur = build_norm(cur, layer.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
