@@ -958,6 +958,9 @@ class GGUFWriter:
     def add_attention_output_group_count(self, count: int) -> None:
         self.add_uint32(Keys.Attention.OUTPUT_GROUP_COUNT.format(arch=self.arch), count)
 
+    def add_attention_noise_head_count(self, count: int) -> None:
+        self.add_uint32(Keys.Attention.NOISE_HEAD_COUNT.format(arch=self.arch), count)
+
     def add_attention_output_lora_rank(self, length: int) -> None:
         self.add_uint32(Keys.Attention.OUTPUT_LORA_RANK.format(arch=self.arch), length)
 

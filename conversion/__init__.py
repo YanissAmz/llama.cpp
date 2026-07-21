@@ -162,6 +162,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "MistralForCausalLM": "llama",
     "MixtralForCausalLM": "llama",
     "ModernBertForMaskedLM": "bert",
+    "MotifForCausalLM": "motif",
     "ModernBertForSequenceClassification": "bert",
     "ModernBertModel": "bert",
     "NemotronForCausalLM": "nemotron",

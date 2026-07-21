@@ -1466,6 +1466,9 @@ class TextModel(ModelBase):
         if chkhsh == "0ef9807a4087ebef797fc749390439009c3b9eda9ad1a097abbe738f486c01e5":
             # ref: https://huggingface.co/meta-llama/Meta-Llama-3-8B
             res = "llama-bpe"
+        if chkhsh == "b26776279bc0cb30fea4ef6adddf5f18c2cb8bcef8a7019bbd4210ed79b8f01b":
+            # ref: https://huggingface.co/Motif-Technologies/Motif-3-Beta
+            res = "motif3"
         if chkhsh == "049ecf7629871e3041641907f3de7c733e4dbfdc736f57d882ba0b0845599754":
             # ref: https://huggingface.co/deepseek-ai/deepseek-llm-7b-base
             res = "deepseek-llm"
