@@ -58,8 +58,10 @@ void llama_model_motif3::load_arch_hparams(llama_model_loader & ml) {
         ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
         hparams.rope_freq_scale_train_swa = 1.0f;
     } else {
-        hparams.swa_type = LLAMA_SWA_TYPE_NONE;
-        hparams.set_swa_pattern(1);
+        // The graph always builds an iSWA attention input, so an all-dense hparams would hand
+        // it a plain unified KV cache and crash inside build_attn. Every released motif3
+        // config declares the window; refuse loudly rather than segfault at graph reserve.
+        throw std::runtime_error("motif3: missing or zero motif3.attention.sliding_window");
     }
 
     switch (hparams.n_layer()) {
