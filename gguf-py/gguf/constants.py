@@ -202,6 +202,11 @@ class Keys:
             KEY_LENGTH = "{arch}.attention.indexer.key_length"
             TOP_K      = "{arch}.attention.indexer.top_k"
 
+    class PolyNorm:
+        OUTPUT_SCALE         = "{arch}.polynorm.output_scale"
+        BIAS_CLAMP           = "{arch}.polynorm.bias_clamp"
+        SIGMOID_WEIGHT       = "{arch}.polynorm.sigmoid_weight"
+
     class HyperConnection:
         COUNT                = "{arch}.hyper_connection.count"
         SINKHORN_ITERATIONS  = "{arch}.hyper_connection.sinkhorn_iterations"

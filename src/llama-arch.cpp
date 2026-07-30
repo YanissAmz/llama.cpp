@@ -261,6 +261,10 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_SHARED_KV_LAYERS,             "%s.attention.shared_kv_layers"             },
     { LLM_KV_ATTENTION_RECURRENT_LAYERS,             "%s.attention.recurrent_layers"             },
 
+    { LLM_KV_POLYNORM_OUTPUT_SCALE,                  "%s.polynorm.output_scale"                  },
+    { LLM_KV_POLYNORM_BIAS_CLAMP,                    "%s.polynorm.bias_clamp"                    },
+    { LLM_KV_POLYNORM_SIGMOID_WEIGHT,                "%s.polynorm.sigmoid_weight"                },
+
     { LLM_KV_HYPER_CONNECTION_COUNT,                 "%s.hyper_connection.count"                 },
     { LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,   "%s.hyper_connection.sinkhorn_iterations"   },
     { LLM_KV_HYPER_CONNECTION_EPSILON,               "%s.hyper_connection.epsilon"               },

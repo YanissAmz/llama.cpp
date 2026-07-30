@@ -179,6 +179,23 @@ class GGUFWriter:
 
         if self.path is not None:
             filenames = self.print_plan()
+            # local resume patch: with GGUF_RESUME=1 and an existing partial
+            # single-shard output, reopen in place; write_tensors_to_file will
+            # verify the regenerated header is byte-identical and then skip
+            # tensor ranges that were already fully written
+            self._resume_stash = None
+            self._resume_limit = 0
+            if os.environ.get("GGUF_RESUME") == "1" and len(filenames) == 1 and os.path.exists(filenames[0]):
+                partial_size = os.path.getsize(filenames[0])
+                if partial_size > 0:
+                    with open(filenames[0], "rb") as fin:
+                        self._resume_stash = fin.read(256 * 1024 * 1024)
+                    self._resume_limit = partial_size
+                    logger.info(f"resume: found partial file ({partial_size} bytes), will verify header and skip completed tensors")
+                    self.fout = [open(filenames[0], "r+b")]
+                    self.fout[0].seek(0)
+                    self.state = WriterState.EMPTY
+                    return
             self.fout = [open(filename, "wb") for filename in filenames]
             self.state = WriterState.EMPTY
 
@@ -443,6 +460,26 @@ class GGUFWriter:
         for fout in self.fout:
             self.write_padding(fout, fout.tell())
 
+        # local resume patch: verify the freshly written header region matches
+        # the partial file byte-for-byte; if not, disable resume (full rewrite)
+        resume_limit = 0
+        if getattr(self, "_resume_limit", 0) > 0 and len(self.fout) == 1:
+            fout0 = self.fout[0]
+            fout0.flush()
+            data_start = fout0.tell()
+            stash = self._resume_stash or b""
+            if data_start <= len(stash):
+                with open(fout0.name, "rb") as fin:
+                    new_header = fin.read(data_start)
+                if new_header == stash[:data_start]:
+                    resume_limit = self._resume_limit
+                    logger.info(f"resume: header verified ({data_start} bytes), skipping tensor data below offset {resume_limit}")
+                else:
+                    logger.warning("resume: header mismatch, falling back to full rewrite")
+            else:
+                logger.warning(f"resume: header larger than stash ({data_start} > {len(stash)}), falling back to full rewrite")
+            self._resume_stash = None
+
         if self.temp_file is None:
             shard_bar = None
             bar = None
@@ -466,7 +503,13 @@ class GGUFWriter:
                 for ti in tensors.values():
                     assert ti.tensor is not None  # can only iterate once over the tensors
                     assert ti.tensor.nbytes == ti.nbytes
-                    ti.tensor.tofile(fout)
+                    offset = fout.tell()
+                    if offset + ti.nbytes <= resume_limit:
+                        # already fully written by the interrupted run: skip
+                        # without evaluating (= without downloading) the tensor
+                        fout.seek(offset + ti.nbytes)
+                    else:
+                        ti.tensor.tofile(fout)
                     if shard_bar is not None:
                         shard_bar.update(ti.nbytes)
                     if bar is not None:
@@ -969,6 +1012,15 @@ class GGUFWriter:
 
     def add_attention_compress_rope_freq_base(self, value: float) -> None:
         self.add_float32(Keys.Attention.COMPRESS_ROPE_FREQ_BASE.format(arch=self.arch), value)
+
+    def add_polynorm_output_scale(self, value: float) -> None:
+        self.add_float32(Keys.PolyNorm.OUTPUT_SCALE.format(arch=self.arch), value)
+
+    def add_polynorm_bias_clamp(self, value: float) -> None:
+        self.add_float32(Keys.PolyNorm.BIAS_CLAMP.format(arch=self.arch), value)
+
+    def add_polynorm_sigmoid_weight(self, value: bool) -> None:
+        self.add_bool(Keys.PolyNorm.SIGMOID_WEIGHT.format(arch=self.arch), value)
 
     def add_hyper_connection_count(self, count: int) -> None:
         self.add_uint32(Keys.HyperConnection.COUNT.format(arch=self.arch), count)

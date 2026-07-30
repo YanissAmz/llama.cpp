@@ -1118,12 +1118,16 @@ struct llama_model_motif3 : public llama_model_base {
                 ggml_tensor * comb,
                 int il) const;
 
-        // PolyNorm activation: w0*rmsnorm(x^3) + w1*rmsnorm(x^2) + w2*rmsnorm(x) + b
+        // PolyNorm activation: w0*rmsnorm(x^3) + w1*rmsnorm(x^2) + w2*rmsnorm(x) + b,
+        // with w passed through a sigmoid and b clamped when the model says so.
         // w has shape {3, nr} (nr = 1 broadcast or one row per column group), b is scalar-ish
+        ggml_tensor * build_poly_scale(ggml_tensor * act) const;
+
         ggml_tensor * build_poly_norm(
                 ggml_tensor * x,
                 ggml_tensor * w,
                 ggml_tensor * b,
+                bool clamp_bias,
                 int il) const;
 
         ggml_tensor * build_attention(
@@ -1131,7 +1135,8 @@ struct llama_model_motif3 : public llama_model_base {
                 llm_graph_input_attn_kv_iswa * inp_attn,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
-                float kq_scale,
+                float kq_scale_full,
+                float kq_scale_swa,
                 int il) const;
     };
 
@@ -1140,7 +1145,7 @@ struct llama_model_motif3 : public llama_model_base {
 
         ggml_tensor * build_attention(
                 const llama_model & model,
-                llm_graph_input_attn_kv * inp_attn,
+                llm_graph_input_attn_kv_iswa * inp_attn,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
                 float kq_scale,

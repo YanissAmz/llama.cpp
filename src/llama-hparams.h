@@ -240,6 +240,14 @@ struct llama_hparams {
     // motif3 (GDLA differential attention)
     uint32_t n_noise_heads = 0;
 
+    // motif3 PolyNorm. These live in config.json but modeling_motif.py never reads them:
+    // its PolyNormTorch is an incomplete re-implementation of the training-time activation.
+    // The trained coefficients are pre-sigmoid and the trained biases are clamped, so the
+    // released weights are only interpretable with these applied.
+    float polynorm_output_scale  = 1.0f;
+    float polynorm_bias_clamp    = 0.0f;   // 0 = no clamp
+    bool  polynorm_sigmoid_weight = false;
+
     // qwen3vl deepstack
     // When parsed from GGUF, this implies the first N layers consume the first
     // N deepstack embeddings. Use deepstack_mapping_arr if you need a more

@@ -84,10 +84,32 @@ class Motif3Model(TextModel):
         self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
         self.gguf_writer.add_attention_noise_head_count(hparams["num_noise_heads"])
 
-        # sliding window attention (interleaved: (il + 1) % period != 0 -> SWA)
+        # sliding window attention, interleaved: dense on il % period == 0, windowed elsewhere.
+        # The +1 mirrors modeling_motif.py: the model was trained with torchtitan passing
+        # window_size=(W, 0) to flash_attn, i.e. a query attends keys within W positions back,
+        # while llama.cpp's LLAMA_SWA_TYPE_STANDARD masks at `p1 - p0 >= n_swa`. n_swa = W + 1
+        # reproduces the trained window exactly (the reference applies the same correction to
+        # compensate HF's (X-1, X-1) convention).
         if hparams.get("use_sliding_window") and hparams.get("sliding_window") is not None:
-            self.gguf_writer.add_sliding_window(hparams["sliding_window"])
+            pattern = hparams.get("sliding_window_pattern", "interleave")
+            if pattern != "interleave":
+                raise ValueError(f"unsupported sliding_window_pattern: {pattern}")
+            self.gguf_writer.add_sliding_window(int(hparams["sliding_window"]) + 1)
             self.gguf_writer.add_sliding_window_pattern(hparams.get("sliding_window_period", 4))
+            swa_rope_theta = hparams.get("swa_rope_theta")
+            if swa_rope_theta is not None:
+                self.gguf_writer.add_rope_freq_base_swa(float(swa_rope_theta))
+
+        # PolyNorm. These three live in config.json but modeling_motif.py never reads them --
+        # its PolyNormTorch is an incomplete re-implementation of the training-time activation.
+        # The checkpoint proves the config is the ground truth: the per-expert PolyNorm biases
+        # sit flush against +-polynorm_bias_clamp, and the coefficients are signed (raw
+        # pre-sigmoid values), which PolyNormTorch's plain weighted sum cannot explain.
+        # `hidden_clamp` is deliberately not emitted: it is 1e6 on the released model, i.e.
+        # inert, and wiring it would add two clamp nodes per FFN for nothing.
+        self.gguf_writer.add_polynorm_output_scale(float(hparams.get("polynorm_output_scale", 1.0)))
+        self.gguf_writer.add_polynorm_bias_clamp(float(hparams.get("polynorm_bias_clamp", 0.0)))
+        self.gguf_writer.add_polynorm_sigmoid_weight(bool(hparams.get("polynorm_sigmoid_weight", True)))
 
         # MoE (expert count and sigmoid gating are set by the base class)
         self.gguf_writer.add_expert_used_count(hparams["experts_top_k"])

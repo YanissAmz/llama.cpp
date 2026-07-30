@@ -22,6 +22,11 @@ void llama_model_motif3::load_arch_hparams(llama_model_loader & ml) {
         hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID;
     }
 
+    // see build_poly_norm: these three are in config.json but not in modeling_motif.py
+    ml.get_key(LLM_KV_POLYNORM_OUTPUT_SCALE,   hparams.polynorm_output_scale,   false);
+    ml.get_key(LLM_KV_POLYNORM_BIAS_CLAMP,     hparams.polynorm_bias_clamp,     false);
+    ml.get_key(LLM_KV_POLYNORM_SIGMOID_WEIGHT, hparams.polynorm_sigmoid_weight, false);
+
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.dsv4_hc_mult);
     ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
     ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
@@ -33,19 +38,28 @@ void llama_model_motif3::load_arch_hparams(llama_model_loader & ml) {
         hparams.rope_yarn_log_mul /= 0.1f;
     }
 
-    // interleaved sliding window attention: full attention every swa_period-th layer
-    uint32_t swa_window = 0;
-    if (ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, swa_window, false) && swa_window > 0) {
+    // Interleaved SWA: full attention every `pattern`-th layer (il % period == 0), windowed
+    // elsewhere. The HF *sdpa* reference silently drops the window (_update_causal_mask
+    // builds one full-causal mask for every layer and the sdpa kernel ignores the
+    // `sliding_window` kwarg), so an sdpa-based oracle cannot validate this path -- but the
+    // released weights were trained with the window, and running full attention everywhere
+    // produces gibberish on the real model.
+    //
+    // NOTE: set_swa_pattern(0) does NOT mean "no SWA" -- the `n_pattern == 0 ||`
+    // short-circuit marks EVERY layer as SWA. The all-dense idiom is set_swa_pattern(1).
+    if (ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false) && hparams.n_swa > 0) {
         uint32_t swa_period = 4;
         ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, swa_period, false);
 
-        // the reference mask keeps sliding_window previous positions plus the current one
-        hparams.n_swa    = swa_window + 1;
         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-        hparams.set_swa_pattern(swa_period);
+        hparams.set_swa_pattern(swa_period, /* dense_first = */ true);
+
+        // windowed layers use plain RoPE on their own freq base, with no YaRN at all
+        ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
+        hparams.rope_freq_scale_train_swa = 1.0f;
     } else {
         hparams.swa_type = LLAMA_SWA_TYPE_NONE;
-        hparams.set_swa_pattern(0);
+        hparams.set_swa_pattern(1);
     }
 
     switch (hparams.n_layer()) {
@@ -319,15 +333,39 @@ ggml_tensor * llama_model_motif3::graph::build_hc_mean(
     return ggml_scale(ctx0, sum, 1.0f/float(hc));
 }
 
+// `polynorm_output_scale` (0.5 on the released model) multiplies the gated activation.
+// Like the sigmoid and the bias clamp, it is declared in config.json and ignored by
+// modeling_motif.py, so an HF-based oracle cannot see it.
+ggml_tensor * llama_model_motif3::graph::build_poly_scale(ggml_tensor * act) const {
+    if (hparams.polynorm_output_scale == 1.0f) {
+        return act;
+    }
+    return ggml_scale(ctx0, act, hparams.polynorm_output_scale);
+}
+
 ggml_tensor * llama_model_motif3::graph::build_poly_norm(
         ggml_tensor * x,
         ggml_tensor * w,
         ggml_tensor * b,
+        bool clamp_bias,
         int il) const {
     GGML_ASSERT(w->ne[0] == 3);
 
     // PolyNorm: w0*rmsnorm(x^3) + w1*rmsnorm(x^2) + w2*rmsnorm(x) + b
     // w is either {3} (shared) or {3, n_expert_used, n_tokens} (gathered per expert)
+    //
+    // The coefficients are stored *pre-sigmoid* and the per-expert biases were trained under
+    // a clamp -- neither is visible in modeling_motif.py, whose PolyNormTorch is an incomplete
+    // re-implementation that reads neither `polynorm_sigmoid_weight` nor `polynorm_bias_clamp`
+    // from its own config. The checkpoint settles it: the per-expert biases sit flush against
+    // +-0.5 = polynorm_bias_clamp, and the coefficients are signed.
+    if (hparams.polynorm_sigmoid_weight) {
+        w = ggml_sigmoid(ctx0, w);
+    }
+    if (clamp_bias && hparams.polynorm_bias_clamp > 0.0f) {
+        b = ggml_clamp(ctx0, b, -hparams.polynorm_bias_clamp, hparams.polynorm_bias_clamp);
+    }
+
     auto coef = [&](int64_t j) {
         return ggml_view_3d(ctx0, w, 1, w->ne[1], w->ne[2], w->nb[1], w->nb[2], j*w->nb[0]);
     };
@@ -349,7 +387,8 @@ ggml_tensor * llama_model_motif3::graph::build_attention(
         llm_graph_input_attn_kv_iswa * inp_attn,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
-        float kq_scale,
+        float kq_scale_full,
+        float kq_scale_swa,
         int il) const {
     const auto & layer = model.layers[il];
 
@@ -365,6 +404,21 @@ ggml_tensor * llama_model_motif3::graph::build_attention(
     const int64_t n_sig_slots   = n_slots - n_noise_slots;
     const int64_t n_sig_heads   = n_head - hparams.n_noise_heads;
     const int64_t nt            = cur->ne[1];
+
+    // Per-layer RoPE. Full-attention layers get the YaRN treatment the reference builds
+    // from `rope_scaling` (ramped inv_freq + position scaling by `factor`); the windowed
+    // layers use plain RoPE on their own freq base with no YaRN at all.
+    //
+    // attn_factor cancels the mscale ggml's YaRN would fold into cos/sin, because the
+    // equivalent mscale^2 correction is applied once in kq_scale instead (deepseek2 idiom).
+    const bool  is_swa        = hparams.is_swa(il);
+    const float freq_base_l   = is_swa ? hparams.rope_freq_base_train_swa : freq_base;
+    const float freq_scale_l  = is_swa ? 1.0f : freq_scale;
+    const float ext_factor_l  = is_swa ? 0.0f : ext_factor;
+    const float attn_factor_l = (is_swa || ext_factor == 0.0f)
+        ? 1.0f
+        : 1.0f / (1.0f + 0.1f * logf(1.0f / freq_scale));
+    const float kq_scale      = is_swa ? kq_scale_swa : kq_scale_full;
 
     GGML_ASSERT(hparams.n_noise_heads % n_head_kv == 0);
     GGML_ASSERT(n_noise_slots == 1 && "only one noise head per kv group is supported");
@@ -387,7 +441,7 @@ ggml_tensor * llama_model_motif3::graph::build_attention(
             ggml_row_size(q->type, n_embd_head_k)*n_head,
             ggml_row_size(q->type, n_embd_head_qk_nope));
     q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr, n_embd_head_qk_rope, rope_type, n_ctx_orig,
-            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+            freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast, beta_slow);
     cb(q_pe, "q_pe", il);
 
     ggml_tensor * Qcur = ggml_concat(ctx0, q_nope, q_pe, 0);
@@ -407,7 +461,7 @@ ggml_tensor * llama_model_motif3::graph::build_attention(
     cb(kv_cmpr, "kv_cmpr", il);
 
     k_pe = ggml_rope_ext(ctx0, k_pe, inp_pos, nullptr, n_embd_head_qk_rope, rope_type, n_ctx_orig,
-            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+            freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast, beta_slow);
     cb(k_pe, "k_pe", il);
 
     // decompress k_nope and v for all kv heads
@@ -475,12 +529,11 @@ llama_model_motif3::graph::graph(const llama_model & model, const llm_graph_para
     const int64_t n_expert_used = hparams.n_expert_used;
     const int64_t hc            = hparams.dsv4_hc_mult;
 
-    // DeepSeek-style YaRN mscale correction folded into kq_scale
-    // (see deepseek2 [TAG_DEEPSEEK2_YARN_LOG_MUL_FIX])
-    GGML_ASSERT(ext_factor >= 0.0f);
-    const float attn_factor_org = attn_factor * (1.0f + 0.1f * logf(1.0f / freq_scale));
-    const float mscale   = attn_factor_org * (1.0f + 0.1f * hparams.rope_yarn_log_mul * logf(1.0f / freq_scale));
-    const float kq_scale = 1.0f * mscale * mscale / sqrtf(float(n_embd_head_k));
+    // The mscale^2 softmax correction applies only to the full-attention layers;
+    // the windowed layers keep the plain 1/sqrt(d) scale (mscale = 0.1*ln(64)+1).
+    const float mscale        = 0.1f * logf(1.0f / hparams.rope_freq_scale_train) + 1.0f;
+    const float kq_scale_full = mscale * mscale / sqrtf(float(n_embd_head_k));
+    const float kq_scale_swa  = 1.0f / sqrtf(float(n_embd_head_k));
 
     ggml_tensor * cur;
 
@@ -508,7 +561,7 @@ llama_model_motif3::graph::graph(const llama_model & model, const llm_graph_para
         cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        cur = build_attention(model, inp_attn, cur, inp_pos, kq_scale, il);
+        cur = build_attention(model, inp_attn, cur, inp_pos, kq_scale_full, kq_scale_swa, il);
 
         inpL = build_hc_post(cur, residual, post, comb, il);
         cb(inpL, "hc_attn_post", il);
@@ -524,8 +577,8 @@ llama_model_motif3::graph::graph(const llama_model & model, const llm_graph_para
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
             ggml_tensor * gate = build_lora_mm(layer.ffn_gate, cur);
             ggml_tensor * up   = build_lora_mm(layer.ffn_up,   cur);
-            gate = build_poly_norm(gate, layer.ffn_poly, layer.ffn_poly_b, il);
-            cur = ggml_mul(ctx0, gate, up);
+            gate = build_poly_norm(gate, layer.ffn_poly, layer.ffn_poly_b, /* clamp_bias = */ false, il);
+            cur = build_poly_scale(ggml_mul(ctx0, gate, up));
             cur = build_lora_mm(layer.ffn_down, cur);
             cb(cur, "ffn_out", il);
         } else {
@@ -569,16 +622,27 @@ llama_model_motif3::graph::graph(const llama_model & model, const llm_graph_para
             ggml_tensor * up = build_lora_mm_id(layer.ffn_up_exps, cur3, selected_experts);
             cb(up, "ffn_moe_up", il);
 
-            // gather the PolyNorm coefficients of the selected experts
-            ggml_tensor * ids_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used*n_tokens);
-            ggml_tensor * poly_w = ggml_get_rows(ctx0, layer.ffn_poly_exps, ids_flat); // [3, n_expert_used*nt]
+            // Per-expert PolyNorm: gather each routed expert's own coefficients
+            // (ffn_poly_exps [3, n_expert], ffn_poly_exps_b [n_expert]) by the
+            // selected expert ids, matching HF GroupedPolyNorm.forward_single(gate,
+            // expert_idx). The trained coeffs differ substantially across experts
+            // (std ~0.1-0.5, max |expert_i - expert_0| up to ~2.9), so the old
+            // expert-0-for-all shortcut produced wrong activations => gibberish.
+            // No-op on the untrained tiny (all coeffs 1/3). build_poly_norm handles
+            // the gathered {3, n_expert_used, n_tokens} weight layout.
+            // flatten the [n_expert_used, n_tokens] ids so get_rows uses the
+            // non-batched form against the token-shared poly tables, then restore
+            // the [., n_expert_used, n_tokens] layout build_poly_norm expects.
+            ggml_tensor * sel_flat = ggml_reshape_1d(ctx0,
+                    ggml_cont(ctx0, selected_experts), n_expert_used * n_tokens);
+            ggml_tensor * poly_w = ggml_get_rows(ctx0, layer.ffn_poly_exps, sel_flat); // [3, neu*nt]
             poly_w = ggml_reshape_3d(ctx0, poly_w, 3, n_expert_used, n_tokens);
             ggml_tensor * poly_b = ggml_get_rows(ctx0,
-                    ggml_reshape_2d(ctx0, layer.ffn_poly_exps_b, 1, n_expert), ids_flat); // [1, n_expert_used*nt]
+                    ggml_reshape_2d(ctx0, layer.ffn_poly_exps_b, 1, n_expert), sel_flat); // [1, neu*nt]
             poly_b = ggml_reshape_3d(ctx0, poly_b, 1, n_expert_used, n_tokens);
 
-            gate = build_poly_norm(gate, poly_w, poly_b, il);
-            cur = ggml_mul(ctx0, gate, up);
+            gate = build_poly_norm(gate, poly_w, poly_b, /* clamp_bias = */ true, il);
+            cur = build_poly_scale(ggml_mul(ctx0, gate, up));
 
             ggml_tensor * experts = build_lora_mm_id(layer.ffn_down_exps, cur, selected_experts); // [n_embd, n_expert_used, nt]
             experts = ggml_mul(ctx0, experts, weights);
@@ -601,8 +665,8 @@ llama_model_motif3::graph::graph(const llama_model & model, const llm_graph_para
             ggml_tensor * ffn_inp = ggml_reshape_2d(ctx0, cur3, n_embd, n_tokens);
             ggml_tensor * sh_gate = build_lora_mm(layer.ffn_gate_shexp, ffn_inp);
             ggml_tensor * sh_up   = build_lora_mm(layer.ffn_up_shexp,   ffn_inp);
-            sh_gate = build_poly_norm(sh_gate, layer.ffn_poly_shexp, layer.ffn_poly_shexp_b, il);
-            ggml_tensor * ffn_shexp = ggml_mul(ctx0, sh_gate, sh_up);
+            sh_gate = build_poly_norm(sh_gate, layer.ffn_poly_shexp, layer.ffn_poly_shexp_b, /* clamp_bias = */ false, il);
+            ggml_tensor * ffn_shexp = build_poly_scale(ggml_mul(ctx0, sh_gate, sh_up));
             ffn_shexp = build_lora_mm(layer.ffn_down_shexp, ffn_shexp);
             cb(ffn_shexp, "ffn_shexp", il);
 
@@ -669,11 +733,12 @@ static ggml_tensor * motif3_poly_norm_flat(
     return cur;
 }
 
-// same differential MLA attention as the trunk, against the plain (non-iswa)
-// KV cache of the MTP draft context
+// same differential MLA attention as the trunk. The MTP block is never a windowed
+// layer (set_swa_pattern leaves the nextn layers dense), but it shares the model's
+// iswa KV cache, so it must take the iswa input to hit the right cache half.
 ggml_tensor * llama_model_motif3::graph_mtp::build_attention(
         const llama_model & model,
-        llm_graph_input_attn_kv * inp_attn,
+        llm_graph_input_attn_kv_iswa * inp_attn,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
         float kq_scale,
@@ -694,6 +759,16 @@ ggml_tensor * llama_model_motif3::graph_mtp::build_attention(
     const int64_t n_sig_slots   = n_slots - n_noise_slots;
     const int64_t n_sig_heads   = n_head - hparams.n_noise_heads;
     const int64_t nt            = cur->ne[1];
+
+    // see the trunk build_attention for the per-layer RoPE / kq_scale rationale
+    const bool  is_swa        = hparams.is_swa(il);
+    const float freq_base_l   = is_swa ? hparams.rope_freq_base_train_swa : freq_base;
+    const float freq_scale_l  = is_swa ? 1.0f : freq_scale;
+    const float ext_factor_l  = is_swa ? 0.0f : ext_factor;
+    const float attn_factor_l = (is_swa || ext_factor == 0.0f)
+        ? 1.0f
+        : 1.0f / (1.0f + 0.1f * logf(1.0f / freq_scale));
+    const float kq_scale_l    = is_swa ? 1.0f / sqrtf(float(n_embd_head_k)) : kq_scale;
 
     GGML_ASSERT(hparams.n_noise_heads % n_head_kv == 0);
     GGML_ASSERT(n_noise_slots == 1 && "only one noise head per kv group is supported");
@@ -716,7 +791,7 @@ ggml_tensor * llama_model_motif3::graph_mtp::build_attention(
             ggml_row_size(q->type, n_embd_head_k)*n_head,
             ggml_row_size(q->type, n_embd_head_qk_nope));
     q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr, n_embd_head_qk_rope, rope_type, n_ctx_orig,
-            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+            freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast, beta_slow);
     cb(q_pe, "mtp_q_pe", il);
 
     ggml_tensor * Qcur = ggml_concat(ctx0, q_nope, q_pe, 0);
@@ -736,7 +811,7 @@ ggml_tensor * llama_model_motif3::graph_mtp::build_attention(
     cb(kv_cmpr, "mtp_kv_cmpr", il);
 
     k_pe = ggml_rope_ext(ctx0, k_pe, inp_pos, nullptr, n_embd_head_qk_rope, rope_type, n_ctx_orig,
-            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+            freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast, beta_slow);
     cb(k_pe, "mtp_k_pe", il);
 
     // decompress k_nope and v for all kv heads
@@ -761,7 +836,7 @@ ggml_tensor * llama_model_motif3::graph_mtp::build_attention(
 
     ggml_tensor * attn = build_attn(inp_attn,
             nullptr, nullptr, nullptr,
-            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale_l, il);
     cb(attn, "mtp_attn_heads", il);
 
     attn = ggml_reshape_4d(ctx0, attn, n_embd_head_v, n_slots, n_head_kv, nt);
@@ -821,11 +896,9 @@ llama_model_motif3::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     GGML_ASSERT(layer.nextn.shared_head_norm && "MTP block missing nextn.shared_head_norm");
     GGML_ASSERT(layer.ffn_gate && "MTP block missing dense ffn");
 
-    // same YaRN mscale correction as the trunk
-    GGML_ASSERT(ext_factor >= 0.0f);
-    const float attn_factor_org = attn_factor * (1.0f + 0.1f * logf(1.0f / freq_scale));
-    const float mscale   = attn_factor_org * (1.0f + 0.1f * hparams.rope_yarn_log_mul * logf(1.0f / freq_scale));
-    const float kq_scale = 1.0f * mscale * mscale / sqrtf(float(n_embd_head_k));
+    // same kq_scale as the trunk (mscale^2 folded, see graph ctor)
+    const float mscale   = 0.1f * logf(1.0f / hparams.rope_freq_scale_train) + 1.0f;
+    const float kq_scale = mscale * mscale / sqrtf(float(n_embd_head_k));
 
     auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
 
@@ -844,7 +917,7 @@ llama_model_motif3::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
-    auto * inp_attn           = build_attn_inp_kv();
+    auto * inp_attn           = build_attn_inp_kv_iswa();
 
     ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
     cb(e_norm, "mtp_enorm", il);
