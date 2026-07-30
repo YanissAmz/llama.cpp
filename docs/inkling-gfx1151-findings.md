@@ -132,11 +132,33 @@ Targets were 30 t/s decode / 300 t/s prefill.
 
 Roofline: ~12B active params at IQ3_XXS ~= 4.6 GB read per token; Strix Halo
 sustains ~210 GB/s => **~45 t/s is the hard decode ceiling**. At 20 t/s we are at
-~45% of roofline, so 30 is physically possible but needs ~50% more, which is not
-available from a flag — it needs either the graph/precision fix plus MoE gather
-work, or speculative decoding (Inkling ships MTP tensors, currently skipped at
-`conversion/inkling.py:16`). Prefill 300 is the more reachable of the two: 246 was
-already observed, it just needs to be observed *correctly*.
+~45% of roofline, so 30 is physically possible but needs ~50% more, and **no flag
+delivers that**. Both targets came up short and should be reported as short:
+
+    decode   20.0 t/s at 3k, 14-16 t/s at agentic depth   vs target 30
+    prefill  182.6 t/s (best CORRECT)                     vs target 300
+
+The 300 is not "nearly there via the 246" — see above, the 246 is garbage-only.
+
+### The one real remaining lever: MTP, and it is a port, not a flag
+
+llama.cpp does have first-class MTP speculation (`--spec-type mtp`,
+`--spec-draft-n-max`), and Inkling genuinely ships MTP layers, so this is the
+credible route from 20 to 30. But it is NOT a matter of un-skipping tensors:
+
+- `conversion/inkling.py:16` skips `model.mtp.*`, AND `InklingModel` does not set
+  `supports_mtp_export` (`conversion/base.py:114` defaults it False). Only glm,
+  hunyuan, qwen and step3 set it. So `--mtp` / `--no-mtp` are refused outright
+  for this architecture.
+- The runtime side is missing too: `LLAMA_CONTEXT_TYPE_MTP` keys off
+  `hparams.n_layer_nextn`, which nothing sets for `LLM_ARCH_INKLING`.
+- We do not even hold the source weights — `~/models/inkling-small/` contains
+  only the UD-IQ3_XXS GGUF. Re-converting needs the upstream checkpoint
+  (NVFP4 ~130G would fit in the 525G free; BF16 would not).
+
+So MTP is the next *project* — converter export path + arch wiring + a re-convert
+— not tonight's flag sweep. Expected payoff if it lands: the 1.4-2.2x that MTP
+reports elsewhere would put decode at 28-44 t/s, i.e. squarely on target.
 
 ## Reproduce
 
