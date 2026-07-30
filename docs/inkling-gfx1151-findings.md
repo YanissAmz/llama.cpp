@@ -152,13 +152,23 @@ credible route from 20 to 30. But it is NOT a matter of un-skipping tensors:
   for this architecture.
 - The runtime side is missing too: `LLAMA_CONTEXT_TYPE_MTP` keys off
   `hparams.n_layer_nextn`, which nothing sets for `LLM_ARCH_INKLING`.
-- We do not even hold the source weights — `~/models/inkling-small/` contains
-  only the UD-IQ3_XXS GGUF. Re-converting needs the upstream checkpoint
-  (NVFP4 ~130G would fit in the 525G free; BF16 would not).
+- We hold only the UD-IQ3_XXS GGUF in `~/models/inkling-small/`, so weights have
+  to come from upstream.
 
-So MTP is the next *project* — converter export path + arch wiring + a re-convert
-— not tonight's flag sweep. Expected payoff if it lands: the 1.4-2.2x that MTP
-reports elsewhere would put decode at 28-44 t/s, i.e. squarely on target.
+So MTP is the next *project* — converter export path + arch wiring — not
+tonight's flag sweep.
+
+**Correction (scoped 2026-07-31, see `inkling-mtp-plan.md`): the weights cost is
+~55 GB, not 532.** `model.safetensors.index.json` puts every MTP tensor in one
+shard, `mtp.safetensors`, **4.46 GB** — the MTP head is dense (`mlp.w13_dn` /
+`mlp.w2_md`, no per-expert tensors), which is also why the draft step is cheap.
+Qwen's `mtp_only` path emits a standalone `mtp-*.gguf` usable as `-md`, so the
+92 GB target GGUF does NOT need re-quantising; only the embed/norm/unembed
+shards (19/25/30, ~50 GB) come along. The real difficulty is elsewhere: Inkling
+declares `num_nextn_predict_layers: 8` (chained, with its own SWA pattern) while
+every existing arch asserts `n_layer_nextn == 1`, so stage 1 exports MTP layer 0
+alone. Expected payoff: 1.4-2.2x on a 14-16 t/s agentic baseline = 20-35 t/s;
+verify is bandwidth-bound here, so assume the low end.
 
 ## Reproduce
 
