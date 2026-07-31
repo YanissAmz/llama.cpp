@@ -324,11 +324,28 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         ggml_tensor * sx = ggml_concat(ctx0, state, xt, 0); // {d_conv + n_seq_tokens, w, n_seqs}
 
         // write the last d_conv time columns back into the cache
-        ggml_tensor * new_state = ggml_view_3d(ctx0, sx, d_conv, w, n_seqs,
-                sx->nb[1], sx->nb[2], (sx->ne[0] - d_conv)*sx->nb[0]);
-        ggml_tensor * state_dst = ggml_view_3d(ctx0, conv_state, d_conv, w, n_seqs,
-                d_conv*sz, n_embd_r*sz, (kv_head*n_embd_r + off)*sz);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, new_state, state_dst));
+        //
+        // [TAG_RECURRENT_ROLLBACK_SPLITS]
+        // With cparams.n_rs_seq > 0 the recurrent tensors are widened to (1 + n_rs_seq)
+        // slot groups so a speculative rollback can restore an earlier state on-device
+        // instead of round-tripping the whole recurrent state through host memory.
+        // Slot s then has to hold the state as of s tokens before the end of the ubatch.
+        // Writing only slot 0 (the n_rs_seq == 0 layout) leaves every snapshot stale and
+        // draft acceptance collapses to exactly zero.
+        // This mirrors llm_build_delta_net_base::build_conv_state.
+        const int64_t mem_size = mctx_recr->get_size();
+        const int64_t K        = (int64_t) cparams.n_rs_seq + 1;
+
+        for (int64_t t = 1; t <= K; ++t) {
+            const int64_t s_idx  = std::max<int64_t>(0, sx->ne[0] - d_conv - K + t);
+            const int64_t s_slot = K - t;
+
+            ggml_tensor * new_state = ggml_view_3d(ctx0, sx, d_conv, w, n_seqs,
+                    sx->nb[1], sx->nb[2], s_idx*sx->nb[0]);
+            ggml_tensor * state_dst = ggml_view_3d(ctx0, conv_state, d_conv, w, n_seqs,
+                    d_conv*sz, n_embd_r*sz, ((s_slot*mem_size + kv_head)*n_embd_r + off)*sz);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, new_state, state_dst));
+        }
 
         ggml_tensor * conv_out = ggml_ssm_conv(ctx0, sx, kernel); // {w, n_seq_tokens, n_seqs}
 
@@ -613,6 +630,11 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
     ggml_build_forward_expand(gf, cur);
 
     for (int il = 0; il < n_layer; ++il) {
+        // Publish the per-layer residual input so DFlash/DSpark drafts can be
+        // conditioned on this model's hidden states (llama_set_embeddings_layer_inp).
+        // Without it llm_graph_result::set_outputs asserts "layer input tensor is null".
+        res->t_layer_inp[il] = cur;
+
         conv_rs_cur = build_rs(inp_hybrid->get_recr(), mctx_recr->get_r_l(il), n_embd_r, n_seqs);
 
         // h += attn_sconv(attn(attn_norm(h)))

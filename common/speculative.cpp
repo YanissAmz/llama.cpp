@@ -2328,6 +2328,23 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
+    // The draft context inherits the target's -b/-ub, so its graph is reserved for a
+    // worst case of n_ubatch tokens. For a DFlash/DSpark draft that graph carries
+    // vocab-sized intermediates (n_tokens x n_vocab), and with -ub 1024 x 201k vocab the
+    // draft's compute buffer reaches ~4.2 GiB -- past the Vulkan max buffer size, so it
+    // spills to a Vulkan_Host allocation. The draft never sees more than one block
+    // (block_size) at a time, so cap its batch rather than the target's.
+    //
+    // Measured on gfx1151 (Inkling-Small + DSpark): draft reserve goes from
+    // Vulkan0 801 MiB + Vulkan_Host 4248 MiB (246 ms) to Vulkan0 262 MiB + Vulkan_Host
+    // 6 MiB (12 ms). This is purely a memory/startup win -- end-to-end tg was unchanged,
+    // so do not credit it with any throughput improvement.
+    {
+        const uint32_t n_batch_dft = 64;
+        cparams.n_batch  = std::min(cparams.n_batch,  n_batch_dft);
+        cparams.n_ubatch = std::min(cparams.n_ubatch, n_batch_dft);
+    }
+
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;

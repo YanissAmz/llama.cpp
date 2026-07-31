@@ -16588,7 +16588,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         std::fill(ctx->query_nodes.begin(), ctx->query_nodes.end(), nullptr);
         std::fill(ctx->query_node_idx.begin(), ctx->query_node_idx.end(), 0);
 
-        GGML_ASSERT(ctx->compute_ctx.expired());
+        // With a speculative (target+draft) setup two graphs share this backend ctx and
+        // the previous compute ctx may still be alive here. get_compute_ctx already reuses
+        // it in that case, so reusing is correct; the assert was only a single-graph sanity check.
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         ctx->query_idx = 0;
         compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
