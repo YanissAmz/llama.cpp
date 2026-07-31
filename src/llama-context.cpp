@@ -101,6 +101,15 @@ llama_context::llama_context(
     }
 
     cparams.n_rs_seq = params.n_rs_seq;
+    // debug A/B: force the host-checkpoint fallback even on a rollback-capable arch
+    if (getenv("LLAMA_NO_RS_ROLLBACK")) {
+        cparams.n_rs_seq = 0;
+    }
+    // debug A/B: force rollback slots on even without a draft model, to isolate the cost
+    // and correctness of the per-slot state writes from the rollback/restore path itself
+    if (const char * e = getenv("LLAMA_FORCE_RS_SEQ")) {
+        cparams.n_rs_seq = (uint32_t) atoi(e);
+    }
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model arch does not support recurrent partial rollback; clamping to 0\n",
                         __func__, cparams.n_rs_seq);

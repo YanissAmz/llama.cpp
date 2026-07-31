@@ -329,22 +329,37 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         // With cparams.n_rs_seq > 0 the recurrent tensors are widened to (1 + n_rs_seq)
         // slot groups so a speculative rollback can restore an earlier state on-device
         // instead of round-tripping the whole recurrent state through host memory.
-        // Slot s then has to hold the state as of s tokens before the end of the ubatch.
-        // Writing only slot 0 (the n_rs_seq == 0 layout) leaves every snapshot stale and
-        // draft acceptance collapses to exactly zero.
-        // This mirrors llm_build_delta_net_base::build_conv_state.
+        // Slot s must hold the state as of s tokens before the end of the sequence.
+        //
+        // Slots 0 .. n_seq_tokens-1 come from this ubatch. Slots beyond that describe
+        // tokens from *earlier* ubatches, so they have to be shifted up from the slots
+        // already in the cache rather than clamped to the start of this ubatch: in the
+        // steady speculative state every ubatch is exactly (n_rs_seq + 1) tokens and the
+        // distinction never shows up, but a single-token AR decode or a draft that
+        // stopped early would otherwise fill every deep slot with the same state and
+        // silently corrupt any rollback deeper than the ubatch.
+        //
+        // The slots are emitted in descending order so each shift reads its source slot
+        // before a later, shallower slot overwrites it.
         const int64_t mem_size = mctx_recr->get_size();
         const int64_t K        = (int64_t) cparams.n_rs_seq + 1;
 
-        for (int64_t t = 1; t <= K; ++t) {
-            const int64_t s_idx  = std::max<int64_t>(0, sx->ne[0] - d_conv - K + t);
-            const int64_t s_slot = K - t;
+        auto slot_view = [&](int64_t slot) {
+            return ggml_view_3d(ctx0, conv_state, d_conv, w, n_seqs,
+                    d_conv*sz, n_embd_r*sz, ((slot*mem_size + kv_head)*n_embd_r + off)*sz);
+        };
 
-            ggml_tensor * new_state = ggml_view_3d(ctx0, sx, d_conv, w, n_seqs,
-                    sx->nb[1], sx->nb[2], s_idx*sx->nb[0]);
-            ggml_tensor * state_dst = ggml_view_3d(ctx0, conv_state, d_conv, w, n_seqs,
-                    d_conv*sz, n_embd_r*sz, ((s_slot*mem_size + kv_head)*n_embd_r + off)*sz);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, new_state, state_dst));
+        for (int64_t s_slot = K - 1; s_slot >= 0; --s_slot) {
+            ggml_tensor * src = nullptr;
+
+            if (s_slot < n_seq_tokens) {
+                src = ggml_view_3d(ctx0, sx, d_conv, w, n_seqs,
+                        sx->nb[1], sx->nb[2], (sx->ne[0] - d_conv - s_slot)*sx->nb[0]);
+            } else {
+                src = slot_view(s_slot - n_seq_tokens);
+            }
+
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, slot_view(s_slot)));
         }
 
         ggml_tensor * conv_out = ggml_ssm_conv(ctx0, sx, kernel); // {w, n_seq_tokens, n_seqs}
