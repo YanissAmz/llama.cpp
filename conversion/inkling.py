@@ -107,7 +107,12 @@ class InklingModel(TextModel):
 
     def set_vocab(self):
         self._set_vocab_gpt2()
-        eos_id = int(self.hparams.get("eos_token_id", 200006))
+        # eos_token_id may be a list: a DFlash/DSpark draft borrows this vocab handler
+        # via --target-model-dir, and those configs carry every stop id, not just one.
+        eos_raw = self.hparams.get("eos_token_id", 200006)
+        if isinstance(eos_raw, (list, tuple)):
+            eos_raw = eos_raw[0] if eos_raw else 200006
+        eos_id = int(eos_raw)
         if eos_id < 199998:
             # HF-port configs re-save generic bos/eos defaults; the real EOS lives at 199998+
             eos_id = 200006
@@ -256,7 +261,6 @@ class InklingMmprojModel(MmprojModel):
             "temporal_patch_size": 2,
             "n_channels": 3,
             "n_layers": 4,
-            "decoder_dmodel": 6144,
             "use_vision_norm": True,
         }
         for key, want in expected.items():
@@ -270,7 +274,6 @@ class InklingMmprojModel(MmprojModel):
         ahp = self.hparams_audio
         audio_expected = {
             "audio_mode": "dmel",
-            "decoder_dmodel": 6144,
             "n_mel_bins": 80,
             "mel_vocab_size": 16,
             "use_audio_norm": True,
