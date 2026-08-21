@@ -256,7 +256,11 @@ escham_kernel_fast(const uint16_t * __restrict__ codes,
         sh  = (m&1)==0 ? 16 : 0;
     }
 
-    const uint16_t * band_codes = codes + (int64_t)band * ntiles * TILE_U16;
+    // TILE_U16 vaut 32 ou 48, donc l'offset de bande est un multiple de 32
+    // uint16 : la vue 32 bits est alignee. nvcc ne peut pas le prouver a travers
+    // un parametre pointeur et emettait deux LDG.U16 par mot.
+    const uint32_t * band32 = reinterpret_cast<const uint32_t *>(codes)
+                            + (int64_t)band * ntiles * NW;
 
     float accA[NJ], accB[NJ];
 #pragma unroll
@@ -279,8 +283,7 @@ escham_kernel_fast(const uint16_t * __restrict__ codes,
             const bool live = tq < t_end;
             wrd[q] = 0;
             if (live && lane < NW) {
-                const int idx = tq*TILE_U16 + lane*2;
-                wrd[q] = (uint32_t)band_codes[idx] | ((uint32_t)band_codes[idx+1] << 16);
+                wrd[q] = band32[tq*NW + lane];   // NW == TILE_U16/2
             }
 #pragma unroll
             for (int u = 0; u < NJ; ++u) {
