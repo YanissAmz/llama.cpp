@@ -604,7 +604,7 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
                 v_part = self._reorder_v_heads(v_part, 0, num_k_heads, num_v_per_k, head_v_dim)
                 data_torch = torch.cat([qk_part, v_part], dim=0)
 
-            elif ".out_proj." in name:
+            elif ".out_proj." in name and data_torch.ndim == 2:
                 # Out projection weight: reorder columns (input dimension)
                 data_torch = self._reorder_v_heads(data_torch, 1, num_k_heads, num_v_per_k, head_v_dim)
 

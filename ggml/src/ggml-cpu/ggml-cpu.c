@@ -211,6 +211,18 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
+static void ggml_vec_dot_escham_not_implemented(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT xv, size_t bx, const void * GGML_RESTRICT yv, size_t by, int nrc) {
+    GGML_UNUSED(n);
+    GGML_UNUSED(s);
+    GGML_UNUSED(bs);
+    GGML_UNUSED(xv);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(yv);
+    GGML_UNUSED(by);
+    GGML_UNUSED(nrc);
+    GGML_ABORT("ESCHAM vec_dot not implemented");
+}
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -287,6 +299,14 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_mxfp4,
         .vec_dot                  = ggml_vec_dot_mxfp4_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_ESCHAM_2] = {
+        .vec_dot                  = ggml_vec_dot_escham_not_implemented,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_ESCHAM_3] = {
+        .vec_dot                  = ggml_vec_dot_escham_not_implemented,
         .nrows                    = 1,
     },
     [GGML_TYPE_NVFP4] = {

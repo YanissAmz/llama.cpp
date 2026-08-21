@@ -756,6 +756,19 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_mxfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp4_ref,
     },
+    // ESCHAM tiles: one 16x16 weight tile per block (decision D1/D2, no kernel yet)
+    [GGML_TYPE_ESCHAM_2] = {
+        .type_name                = "escham_2",
+        .blck_size                = 256,
+        .type_size                = 64,   // 16*K int16, K=2
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_ESCHAM_3] = {
+        .type_name                = "escham_3",
+        .blck_size                = 256,
+        .type_size                = 96,   // 16*K int16, K=3
+        .is_quantized             = true,
+    },
     [GGML_TYPE_NVFP4] = {
         .type_name                = "nvfp4",
         .blck_size                = QK_NVFP4,
