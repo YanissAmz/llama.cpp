@@ -6,7 +6,21 @@ Writes the 2-bit escha codes into a GGUF, band-major (see write_linear):
                       ne = (IC, OC), bytes band-major (OC/16, IC/16, 16*K)
   <name>.escha_in   : F32 [IC]   = s_in * rin   (folded in float32, D5)
   <name>.escha_out  : F32 [OC]   = s_out * rout (folded in float32, D5)
-  <name>.escha_bias : F32 [OC]   = existing .bias
+  <name>.bias       : F32 [OC]   = the checkpoint's STANDARD bias (NOT an escha
+                      extra; the oracle carries it under the same llama.cpp
+                      name and the loader already applies it).
+
+The converter's tensor transforms are reproduced here (conversion/qwen.py,
+Qwen3_5TextModel <- _LinearAttentionVReorderBase <- Qwen3NextModel), because
+the llama.cpp qwen35 loader expects the CONVERTED forms, not the HF ones:
+  - RMS norms +1.0 (attn_norm, post_attention_norm, attn_q/k_norm, output_norm;
+    NOT linear_attn.norm) — loader subtracts 1;
+  - ssm_a = -exp(A_log), v-head reorder on A_log / dt_bias / in_proj_a /
+    in_proj_b / conv1d v-channels;
+  - linear_attn projections (in_proj_qkv, in_proj_z, out_proj): the 48 v-heads
+    go from HF grouped-by-k-head order to tiled order (16 groups of 3 ->
+    3 groups of 16), on code rows/cols, escha_in/escha_out and the qkv/z biases.
+All verified value-exact against escha-oracle-q8_0.gguf (see m5a_datacheck.py).
 Embeddings / lm_head arrive ALREADY rowwise-int8-quantized in the checkpoint
 (`*.weight_int8` + per-row `*.weight_scale` F16): re-encoded EXACTLY as Q8_0
 (the row scale repeated over the row's 32-value blocks). Everything else
@@ -168,6 +182,57 @@ GLOBAL_NAMES = {
     "lm_head":            "output",
 }
 
+# ---------------------------------------------------------------------------
+# Converter value transforms (conversion/qwen.py :: Qwen3NextModel +
+# _LinearAttentionVReorderBase; active here because linear_num_key_heads=16 !=
+# linear_num_value_heads=48). The llama.cpp qwen35 loader expects the CONVERTED
+# forms, so raw checkpoint values would be silently wrong:
+#   - RMS norms stored +1.0 (loader subtracts 1); NOT linear_attn.norm
+#   - ssm_a = -exp(A_log)
+#   - the 48 v-heads go grouped-by-k-head (16 groups of 3) -> tiled (3 of 16),
+#     on A_log/dt_bias/in_proj_a/in_proj_b rows, conv1d v-channels, the OC side
+#     of in_proj_qkv/in_proj_z (rows, codes, escha_out, bias) and the IC side
+#     of out_proj. Validated against the oracle in m5a_datacheck.py.
+# ---------------------------------------------------------------------------
+_N_K_HEADS, _N_V_HEADS, _V_HEAD_DIM = 16, 48, 128   # config.json, linear_attn
+VPERM48 = np.arange(_N_V_HEADS).reshape(_N_K_HEADS, _N_V_HEADS // _N_K_HEADS) \
+                 .transpose(1, 0).ravel()            # grouped -> tiled, heads
+R192 = (VPERM48[:, None] * _V_HEAD_DIM
+        + np.arange(_V_HEAD_DIM)[None, :]).ravel()   # rows within heads
+T48 = (VPERM48[:, None] * (_V_HEAD_DIM // 16)
+       + np.arange(_V_HEAD_DIM // 16)[None, :]).ravel()  # 16-row code tiles
+
+
+def convert_transform(name: str, a: np.ndarray) -> np.ndarray:
+    """Mapped-name F32 tensor: checkpoint values -> loader-convention values."""
+    if name.endswith(("attn_norm.weight", "post_attention_norm.weight",
+                      "attn_q_norm.weight", "attn_k_norm.weight")) \
+            or name == "output_norm.weight":
+        return (a + np.float32(1.0)).astype(np.float32)
+    if re.fullmatch(r"blk\.\d+\.ssm_a", name):
+        return np.take((-np.exp(a.astype(np.float32))).astype(np.float32),
+                       VPERM48, axis=0)
+    if re.fullmatch(r"blk\.\d+\.ssm_dt\.bias", name):
+        return np.take(a, VPERM48, axis=0)
+    if re.fullmatch(r"blk\.\d+\.ssm_(alpha|beta)\.weight", name):
+        # the checkpoint flattens these; llama.cpp wants (n_embd, n_v_heads),
+        # i.e. numpy (n_v_heads, n_embd). Raveling back drops the shape and the
+        # loader then reads one long row.
+        return np.take(a.reshape(_N_V_HEADS, -1), VPERM48, axis=0)
+    if re.fullmatch(r"blk\.\d+\.ssm_conv1d\.weight", name):
+        a = a.reshape(a.shape[0], -1)                  # (channels, kernel)
+        v0 = _N_K_HEADS * 2 * _V_HEAD_DIM              # q|k channels first
+        a[v0:] = a[v0:].reshape(_N_V_HEADS, _V_HEAD_DIM, a.shape[1]) \
+            [VPERM48].reshape(-1, a.shape[1])
+        return a
+    m = re.fullmatch(r"blk\.\d+\.(attn_qkv|attn_gate)\.bias", name)
+    if m:                                              # v-part rows only
+        n_qk = a.shape[0] - _N_V_HEADS * _V_HEAD_DIM
+        idx = np.concatenate([np.arange(n_qk), n_qk + R192])
+        return np.take(a, idx, axis=0)
+    return a
+
+
 _SUFFIXES = (".escha_in", ".escha_out", ".weight_int8", ".weight_scale",
              ".weight", ".bias")
 
@@ -240,6 +305,7 @@ def set_metadata(w: "gguf.GGUFWriter", cp: Checkpoint, codebooks=()):
     print(f"[kv] {n} keys copied from the oracle")
 
 
+
 # ---------------------------------------------------------------------------
 # Tensor writers
 # ---------------------------------------------------------------------------
@@ -261,7 +327,8 @@ def copy_f32(cp: Checkpoint, key: str, w: "gguf.GGUFWriter"):
         assert squeezed.ndim == 2, (key, out.shape)
         assert "conv1d" in key, f"unexpected >2D tensor: {key} {out.shape}"
         out = squeezed
-    w.add_tensor(gguf_name(key), out)
+    name = gguf_name(key)
+    w.add_tensor(name, convert_transform(name, out))
 
 
 def copy_f16(cp: Checkpoint, key: str, w: "gguf.GGUFWriter"):
@@ -297,41 +364,76 @@ def write_int8_row(cp: Checkpoint, key: str, w: "gguf.GGUFWriter"):
         blob[i:j, :, 2:] = q.reshape(j - i, nb, 32).view(np.uint8)
         d = np.repeat(scale[i:j, None], nb, axis=1).view(np.uint8).reshape(j - i, nb, 2)
         blob[i:j, :, :2] = d
+    # ssm_alpha/ssm_beta are linear_attn projections with one row per V head:
+    # they need the same grouped->tiled reorder as the rest. convert_transform
+    # cannot do it here, the rows are already Q8_0 blocks.
+    gname = gguf_name(name)
+    if re.fullmatch(r"blk\.\d+\.ssm_(alpha|beta)\.weight", gname):
+        assert n_row == _N_V_HEADS, (name, n_row)
+        blob = np.take(blob, VPERM48, axis=0)
+
     # data is uint8, so gguf reads raw_shape as a BYTE shape and converts it
     # back to (n_row, n_col) itself.
-    w.add_tensor(gguf_name(name), blob.reshape(-1),
+    w.add_tensor(gname, blob.reshape(-1),
                  raw_shape=(n_row, nb * 34),
                  raw_dtype=gguf.GGMLQuantizationType.Q8_0)
 
 
 def write_linear(cp: Checkpoint, prefix: str, w: "gguf.GGUFWriter"):
     L, K, V, cb, IC, OC = cp.escha_config(prefix)
+    # mapped base name WITHOUT suffix, e.g. blk.8.attn_qkv
+    base = gguf_name(prefix + ".weight").rpartition(".")[0]
+    kind = base.split(".", 2)[2]
+    v_oc = kind in ("attn_qkv", "attn_gate")       # OC side carries v-heads
+    v_ic = kind == "ssm_out"                       # IC side carries v-heads
 
     code = np.asarray(cp.get(prefix + ".escha_code"), dtype=np.int16)
     # Checkpoint order is (IC//16, OC//16, 16*K): IC-tile major. A ggml row is
     # one OC band (D2: ne0 = IC*16, ne1 = OC/16), so the band's IC tiles must be
     # contiguous -> transpose the two tile axes. NOT a verbatim copy.
     assert code.shape == (IC // 16, OC // 16, 16 * K), (prefix, code.shape)
-    flat = np.ascontiguousarray(code.transpose(1, 0, 2)).reshape(-1)
+    flat = np.ascontiguousarray(code.transpose(1, 0, 2))
+    # v-head reorder on the coded payload too: whole 16-row tiles move
+    # together (the 16x16 code tiles never mix rows across a head boundary).
+    # attn_qkv/attn_gate OC side = q|k bands first: permute the v bands only.
+    if v_oc:
+        n_qk_bands = (OC - _N_V_HEADS * _V_HEAD_DIM) // 16
+        # each v-head owns DV//16 contiguous bands: permute the head axis
+        v = flat[n_qk_bands:].reshape(_N_V_HEADS, _V_HEAD_DIM // 16,
+                                      IC // 16, 16 * K)[VPERM48]
+        flat = np.concatenate(
+            [flat[:n_qk_bands], v.reshape(-1, IC // 16, 16 * K)], axis=0)
+    if v_ic:  # ssm_out IC side is all-v (out_proj input = z output)
+        flat = flat.reshape(OC // 16, _N_V_HEADS, _V_HEAD_DIM // 16,
+                            16 * K)[:, VPERM48]
+    flat = np.ascontiguousarray(flat).reshape(-1)
     expect = IC * OC * K // 16  # int16 elements: 16*K words per 16x16 tile
     assert flat.size == expect, (prefix, flat.size, expect)
     # raw_shape is numpy-order (rows=ne1, cols=ne0) -> ne = (IC, OC), the
     # natural ggml shape. The band-major byte order above is what the
     # tile-aware mul_mat branch expects; blck_size 16 / type_size 2*K makes
     # ggml_row_size land exactly on IC*K/8 bytes per output row.
-    w.add_tensor(gguf_name(prefix + ".weight"), flat,
+    w.add_tensor(base + ".weight", flat,
                  raw_shape=(OC, IC),
                  raw_dtype=escha_type_id(K))
 
     rin = cp.get(prefix + ".escha_rin").astype(np.float32).ravel()
     s_in = cp.get(prefix + ".escha_s_in").astype(np.float32).ravel()
     assert rin.size == IC and s_in.size == IC, prefix
-    w.add_tensor(gguf_name(prefix + ".escha_in"), (s_in * rin).astype(np.float32))
+    ein = (s_in * rin).astype(np.float32)
+    if v_ic:
+        ein = np.take(ein, R192, axis=0)
+    w.add_tensor(base + ".escha_in", ein)
 
     rout = cp.get(prefix + ".escha_rout").astype(np.float32).ravel()
     s_out = cp.get(prefix + ".escha_s_out").astype(np.float32).ravel()
     assert rout.size == OC and s_out.size == OC, prefix
-    w.add_tensor(gguf_name(prefix + ".escha_out"), (s_out * rout).astype(np.float32))
+    eout = (s_out * rout).astype(np.float32)
+    if v_oc:
+        eout = np.concatenate([eout[:OC - _N_V_HEADS * _V_HEAD_DIM],
+                               np.take(eout[OC - _N_V_HEADS * _V_HEAD_DIM:],
+                                       R192, axis=0)])
+    w.add_tensor(base + ".escha_out", eout)
 
     # NOT an escha extra: <proj>.bias IS the model's standard bias. The oracle
     # carries it as blk.N.ffn_down.bias and the llama.cpp loader already reads
@@ -340,7 +442,7 @@ def write_linear(cp: Checkpoint, prefix: str, w: "gguf.GGUFWriter"):
     if prefix + ".bias" in cp.index:
         bias = cp.get(prefix + ".bias").astype(np.float32).ravel()
         assert bias.size == OC, prefix
-        w.add_tensor(gguf_name(prefix + ".bias"), bias)
+        w.add_tensor(base + ".bias", convert_transform(base + ".bias", bias))
     return K
 
 
@@ -435,6 +537,25 @@ def verify(cp: Checkpoint, prefixes, out: Path):
         orig = np.ascontiguousarray(
             np.asarray(cp.get(prefix + ".escha_code"), dtype=np.int16)
         ).reshape(shape)
+        # mirror write_linear's v-head reorder so the comparison stays exact
+        base = gguf_name(prefix + ".weight").rpartition(".")[0]
+        kind = base.split(".", 2)[2]
+        if kind in ("attn_qkv", "attn_gate"):
+            n_qk_bands = (OC - _N_V_HEADS * _V_HEAD_DIM) // 16
+            # checkpoint order (IC//16, OC//16, 16K): v-heads live on axis 1
+            v = orig[:, n_qk_bands:].reshape(
+                IC // 16, _N_V_HEADS, _V_HEAD_DIM // 16,
+                16 * K)[:, VPERM48]
+            orig = np.ascontiguousarray(
+                np.concatenate([orig[:, :n_qk_bands],
+                                v.reshape(IC // 16, -1, 16 * K)], axis=1)
+            ).reshape(shape)
+        elif kind == "ssm_out":
+            # all-v IC side: heads group the axis-0 tiles by 8
+            orig = np.ascontiguousarray(
+                orig.reshape(_N_V_HEADS, _V_HEAD_DIM // 16, OC // 16,
+                             16 * K)[VPERM48]
+            ).reshape(shape)
         # The GGUF is band-major: (OC//16, IC//16, 16*K). Undo the transpose
         # and require the checkpoint order back, byte for byte.
         got = read_raw_i16(f, data_start, off, orig.size * 2)
