@@ -171,6 +171,155 @@ __global__ void escham_kernel(const uint16_t * codes, const float * x, float * y
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Chemin rapide : une tuile par warp, zero shared, zero barriere.
+//
+// Ce que le kernel d'origine faisait mal, mesure a 1,05 t/s en generation :
+// 16 threads utiles sur 64, 320 blocs sur 82 SM, deux __syncthreads() par
+// tuile de 16x16, et les 16 lanes relisant les memes 16 valeurs de x depuis
+// la memoire globale a chaque tuile.
+//
+// La geometrie de la tuile rend tout ca inutile. Le thread m (0..31) decode 8
+// poids aux positions (r0 + {9,8,1,0}, c0 + {8,8,8,8,0,0,0,0} + d) avec
+// r0 = 2*(m&3), c0 = 2*((m>>3)&1) + 4*((m>>4)&1), d = (m>>2)&1. Donc :
+//   - un thread ne touche que DEUX colonnes de sortie, cA = c0+d et cB = cA+8 ;
+//   - ce couple ne depend pas de la tuile, donc les accumulateurs vivent en
+//     registres sur toute la bande et la reduction n'a lieu qu'une fois ;
+//   - les 4 threads d'un meme groupe (m>>2) visent le meme couple, la reduction
+//     est un __shfl_down_sync de largeur 4.
+// Les mots de code et les 16 valeurs de x circulent par __shfl_sync : lane l
+// charge le mot l (resp. x[t*16+l]) et les autres se servent. Une seule lecture
+// coalescee par tuile pour chacun.
+// ---------------------------------------------------------------------------
+
+template<bool K3, int NJ>
+__global__ void __launch_bounds__(256)
+escham_kernel_fast(const uint16_t * __restrict__ codes,
+                   const float * __restrict__ x,
+                   float * __restrict__ y,
+                   int ic, int oc, int nc,
+                   const float * __restrict__ lut,
+                   int tiles_per_chunk){
+    const int TILE_U16 = K3 ? 48 : 32;
+    const int NW       = K3 ? 24 : 16;
+    const int ntiles   = ic / 16;
+
+    const int band = blockIdx.x;
+    const int j0   = blockIdx.y * NJ;
+    const int t_begin = (int)blockIdx.z * tiles_per_chunk;
+    const int t_end   = min(ntiles, t_begin + tiles_per_chunk);
+
+    const int warp   = threadIdx.x >> 5;
+    const int lane   = threadIdx.x & 31;
+    const int nwarps = blockDim.x >> 5;
+
+    const int m  = lane;
+    const int r0 = 2*(m & 3);
+    const int c0 = 2*((m>>3)&1) + 4*((m>>4)&1);
+    const int d  = (m>>2)&1;
+    const int cA = c0 + d;        // s = 4..7
+    const int cB = c0 + 8 + d;    // s = 0..3
+
+    int cur, prv, sh;
+    if (K3) {
+        const int b = m*24, r86 = b + 791, r87 = r86 & 2016;
+        cur = (((r86>>3)&252)-96)/4;
+        prv = (m==0) ? 23 : (((b+755)>>5)-24);
+        sh  = r87 - b - 760;
+    } else {
+        cur = (m>>1)&15;
+        prv = (cur-1)&15;
+        sh  = (m&1)==0 ? 16 : 0;
+    }
+
+    const uint16_t * band_codes = codes + (int64_t)band * ntiles * TILE_U16;
+
+    float accA[NJ], accB[NJ];
+#pragma unroll
+    for (int u = 0; u < NJ; ++u) { accA[u] = 0.f; accB[u] = 0.f; }
+
+    for (int t = t_begin + warp; t < t_end; t += nwarps) {
+        uint32_t wrd = 0;
+        if (lane < NW) {
+            const int idx = t*TILE_U16 + lane*2;
+            wrd = (uint32_t)band_codes[idx] | ((uint32_t)band_codes[idx+1] << 16);
+        }
+        const uint64_t pair = ((uint64_t)__shfl_sync(0xffffffffu, wrd, prv) << 32)
+                            |  (uint64_t)__shfl_sync(0xffffffffu, wrd, cur);
+
+        float wv[8];
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            const uint16_t win = (uint16_t)((pair >> (sh + (K3?3:2)*s)) & 0xffffu);
+            wv[s] = lut[win];
+        }
+
+        const int rows[4] = { r0+9, r0+8, r0+1, r0+0 };
+#pragma unroll
+        for (int u = 0; u < NJ; ++u) {
+            const int j = j0 + u;
+            // lane l detient x[t*16 + l] ; les autres se servent par shuffle.
+            const float xv = (j < nc) ? x[(int64_t)j*ic + t*16 + (lane & 15)] : 0.f;
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                const float xr = __shfl_sync(0xffffffffu, xv, rows[s]);
+                accB[u] += wv[s]   * xr;
+                accA[u] += wv[s+4] * xr;
+            }
+        }
+    }
+
+    // les 4 lanes d'un groupe (m>>2) visent le meme couple de colonnes
+#pragma unroll
+    for (int u = 0; u < NJ; ++u) {
+        accA[u] += __shfl_down_sync(0xffffffffu, accA[u], 2, 4);
+        accB[u] += __shfl_down_sync(0xffffffffu, accB[u], 2, 4);
+        accA[u] += __shfl_down_sync(0xffffffffu, accA[u], 1, 4);
+        accB[u] += __shfl_down_sync(0xffffffffu, accB[u], 1, 4);
+    }
+
+    // un seul atomicAdd global par (colonne, sortie) et par bloc
+    __shared__ float s_acc[NJ][16];
+    for (int i = threadIdx.x; i < NJ*16; i += blockDim.x) {
+        s_acc[i>>4][i&15] = 0.f;
+    }
+    __syncthreads();
+    if ((lane & 3) == 0) {
+#pragma unroll
+        for (int u = 0; u < NJ; ++u) {
+            atomicAdd(&s_acc[u][cA], accA[u]);
+            atomicAdd(&s_acc[u][cB], accB[u]);
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < NJ*16; i += blockDim.x) {
+        const int u = i >> 4, c = i & 15;
+        const int j = j0 + u;
+        if (j < nc) {
+            atomicAdd(&y[(int64_t)j*oc + band*16 + c], s_acc[u][c]);
+        }
+    }
+}
+
+template<bool K3, int NJ>
+static void escham_launch_fast(const uint16_t * codes, const float * x, float * y,
+                               int64_t ic, int64_t oc, int64_t nc, cudaStream_t st){
+    const int ntiles = (int)(ic/16);
+    const int nbands = (int)(oc/16);
+    const int njb    = (int)((nc + NJ - 1)/NJ);
+    // on vise ~2048 blocs pour remplir la carte ; en generation de token njb == 1
+    // et sans decoupage de ic on ne lancerait que `nbands` blocs.
+    int chunks = 2048 / (nbands*njb);
+    if (chunks < 1) chunks = 1;
+    if (chunks > ntiles/8 + 1) chunks = ntiles/8 + 1;
+    const int tiles_per_chunk = (ntiles + chunks - 1)/chunks;
+    chunks = (ntiles + tiles_per_chunk - 1)/tiles_per_chunk;
+    dim3 grid((unsigned)nbands, (unsigned)njb, (unsigned)chunks);
+    escham_kernel_fast<K3, NJ><<<grid, 256, 0, st>>>(codes, x, y, (int)ic, (int)oc, (int)nc,
+                                                     d_lut, tiles_per_chunk);
+}
+
 void ggml_cuda_escham_mul_mat_raw(const void * src0_data, const void * src1_data, void * dst_data,
                                   int64_t ic, int64_t oc, int64_t nc, int is_k3, void * stream){
     escham_cuda_init_tables();
@@ -182,11 +331,16 @@ void ggml_cuda_escham_mul_mat_raw(const void * src0_data, const void * src1_data
     int64_t nbands = oc/16;
     dim3 block(16,4);
     dim3 grid((unsigned)nbands, (unsigned)((nc+3)/4));
-    if(is_k3){
-        escham_kernel<true><<<grid, block, 0, st>>>(codes,x,y,(int)ic,(int)oc,(int)nc,d_lut);
+    // le chemin rapide accumule : il faut partir de zero.
+    CUDA_CHECK(cudaMemsetAsync(y, 0, (size_t)nc*oc*sizeof(float), st));
+    if(nc == 1){
+        if(is_k3) escham_launch_fast<true , 1>(codes,x,y,ic,oc,nc,st);
+        else      escham_launch_fast<false, 1>(codes,x,y,ic,oc,nc,st);
     } else {
-        escham_kernel<false><<<grid, block, 0, st>>>(codes,x,y,(int)ic,(int)oc,(int)nc,d_lut);
+        if(is_k3) escham_launch_fast<true , 4>(codes,x,y,ic,oc,nc,st);
+        else      escham_launch_fast<false, 4>(codes,x,y,ic,oc,nc,st);
     }
+    (void)grid; (void)block; (void)nbands;
     CUDA_CHECK(cudaGetLastError());
 }
 
