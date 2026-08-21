@@ -271,12 +271,12 @@ escham_kernel_fast(const uint16_t * __restrict__ codes,
     // entierement dependante, un seul flux en vol laisserait le warp bloque sur
     // la latence memoire. Les bornes ne dependent que de (t, q, nwarps), donc
     // elles sont uniformes sur le warp et les __shfl_sync restent legitimes.
-    const int rows[4] = { r0+9, r0+8, r0+1, r0+0 };
     const int UNR = 2;
 
     for (int t = t_begin + warp; t < t_end; t += UNR*nwarps) {
         uint32_t wrd[UNR];
-        float    xv [UNR][NJ];
+        float2   xv [UNR][NJ];   // x[r0+0], x[r0+1]
+        float2   xv8[UNR][NJ];   // x[r0+8], x[r0+9]
 #pragma unroll
         for (int q = 0; q < UNR; ++q) {
             const int tq = t + q*nwarps;
@@ -288,8 +288,18 @@ escham_kernel_fast(const uint16_t * __restrict__ codes,
 #pragma unroll
             for (int u = 0; u < NJ; ++u) {
                 const int j = j0 + u;
-                // lane l detient x[tq*16 + l] ; les autres se servent par shuffle.
-                xv[q][u] = (live && j < nc) ? x[(int64_t)j*ic + tq*16 + (lane & 15)] : 0.f;
+                // Les 4 lignes dont ce lane a besoin sont r0+{0,1,8,9} : deux
+                // couples adjacents. Deux lectures 64 bits remplacent une
+                // lecture 32 bits suivie de quatre __shfl_sync. r0 est pair et
+                // tq*16 est aligne sur 64 octets, donc float2 est aligne.
+                if (live && j < nc) {
+                    const float * xb = x + (int64_t)j*ic + tq*16 + r0;
+                    xv[q][u]   = *reinterpret_cast<const float2 *>(xb);
+                    xv8[q][u]  = *reinterpret_cast<const float2 *>(xb + 8);
+                } else {
+                    xv[q][u]  = make_float2(0.f, 0.f);
+                    xv8[q][u] = make_float2(0.f, 0.f);
+                }
             }
         }
 
@@ -303,13 +313,14 @@ escham_kernel_fast(const uint16_t * __restrict__ codes,
                 const uint16_t win = (uint16_t)((pair >> (sh + (K3?3:2)*s)) & 0xffffu);
                 wv[s] = escham_decode(win);
             }
+            // rows[] = { r0+9, r0+8, r0+1, r0+0 } dans cet ordre
 #pragma unroll
             for (int u = 0; u < NJ; ++u) {
+                const float xr[4] = { xv8[q][u].y, xv8[q][u].x, xv[q][u].y, xv[q][u].x };
 #pragma unroll
                 for (int s = 0; s < 4; ++s) {
-                    const float xr = __shfl_sync(0xffffffffu, xv[q][u], rows[s]);
-                    accB[u] += wv[s]   * xr;
-                    accA[u] += wv[s+4] * xr;
+                    accB[u] += wv[s]   * xr[s];
+                    accA[u] += wv[s+4] * xr[s];
                 }
             }
         }
