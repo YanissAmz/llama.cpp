@@ -1285,6 +1285,9 @@ static void ggml_compute_forward_mul_mat_escham(
     const struct ggml_tensor * src1 = dst->src[1];
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    // the band pointer is computed from src0->data and ignores nb01: a view
+    // would be read at the wrong stride, silently.
+    GGML_ASSERT(ggml_is_contiguous(src0));
     GGML_ASSERT(ggml_is_contiguous(src1));
     GGML_ASSERT(ggml_is_contiguous(dst));
     GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
@@ -1306,20 +1309,26 @@ static void ggml_compute_forward_mul_mat_escham(
     const float    * x     = (const float    *) src1->data;
     float          * y     = (float          *) dst->data;
 
-    // one band decoded dense: (IC, 16) fp16, 160 KiB at IC=5120
-    uint16_t * wb = (uint16_t *) malloc((size_t)ic * 16 * sizeof(uint16_t));
-    if (!wb) {
-        GGML_ABORT("escham: out of memory for the band buffer");
-    }
+    // One band decoded dense to fp32: (IC, 16), 320 KiB at IC=5120. Taken from
+    // wdata (sized in ggml_graph_plan), not malloc'd: this runs once per
+    // projection per token, tens of thousands of times per forward pass.
+    // fp32 and not fp16 so the conversion is paid once per band instead of
+    // once per band AND column.
+    float * wbf = (float *) params->wdata + (size_t)params->ith * ic * 16;
 
     for (int64_t b = params->ith; b < nbands; b += params->nth) {
         const uint16_t * band = codes + (size_t)b * ntiles * tile_u16;
         for (int64_t t = 0; t < ntiles; t++) {
             // tile rows are IC-local, tile cols are the band's 16 outputs
+            uint16_t tmp[256];
             if (k3) {
-                escham_decode_tile_k3(band + (size_t)t * tile_u16, wb + t * 256);
+                escham_decode_tile_k3(band + (size_t)t * tile_u16, tmp);
             } else {
-                escham_decode_tile_k2(band + (size_t)t * tile_u16, wb + t * 256);
+                escham_decode_tile_k2(band + (size_t)t * tile_u16, tmp);
+            }
+            float * wt = wbf + t * 256;
+            for (int e = 0; e < 256; e++) {
+                wt[e] = GGML_CPU_FP16_TO_FP32(tmp[e]);
             }
         }
         for (int64_t j = 0; j < nc; j++) {
@@ -1327,12 +1336,9 @@ static void ggml_compute_forward_mul_mat_escham(
             float acc[16] = { 0 };
             for (int64_t i = 0; i < ic; i++) {
                 const float xv = xj[i];
-                if (xv == 0.0f) {
-                    continue;
-                }
-                const uint16_t * wr = wb + i * 16;
+                const float * wr = wbf + i * 16;
                 for (int o = 0; o < 16; o++) {
-                    acc[o] += GGML_CPU_FP16_TO_FP32(wr[o]) * xv;
+                    acc[o] += wr[o] * xv;
                 }
             }
             float * yj = y + j * oc + b * 16;
@@ -1341,8 +1347,6 @@ static void ggml_compute_forward_mul_mat_escham(
             }
         }
     }
-
-    free(wb);
 }
 
 void ggml_compute_forward_mul_mat(
@@ -2952,6 +2956,13 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_MUL_MAT:
                     {
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
+
+                        if (node->src[0]->type == GGML_TYPE_ESCHAM_2 ||
+                            node->src[0]->type == GGML_TYPE_ESCHAM_3) {
+                            // one dense (IC, 16) fp32 band buffer per thread
+                            cur = sizeof(float) * node->src[0]->ne[0] * 16 * n_tasks;
+                            break;
+                        }
 
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));

@@ -289,7 +289,7 @@ static int test_record(const char *name, int K, int IC, int OC, int NT, int NR,
                 for (int64_t i = 0; i < ic; i++) {
                     acc += (double)ggml_fp16_to_fp32(whc[i * oc + o]) * (double)xj0[i];
                 }
-                printf(" %.6f/%.6f", d_z[o * nr], (float)acc);
+                printf(" %.6f/%.6f", d_z[o], (float)acc);
             }
             printf("\n");
             // integrity: tw must still hold the transposed Wh after the graph run
