@@ -1460,6 +1460,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     backend_cpu      (params.backend_cpu),
     cvec             (params.cvec),
     loras            (params.loras),
+    escha            (params.escha),
+    escha_rot_src    (params.escha_rot_src),
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
@@ -1484,10 +1486,76 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+void llm_graph_input_escha_rot::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    GGML_ASSERT(rot && rot->buffer);
+    GGML_ASSERT(ggml_backend_buffer_is_host(rot->buffer));
+    GGML_ASSERT(ggml_nbytes(rot) == src.size()*sizeof(float));
+
+    memcpy(rot->data, src.data(), ggml_nbytes(rot));
+}
+
+ggml_tensor * llm_graph_context::build_escha_rot() const {
+    // one per graph: 400 coded projections share it
+    if (escha_rot) {
+        return escha_rot;
+    }
+
+    auto inp = std::make_unique<llm_graph_input_escha_rot>(*escha_rot_src);
+
+    inp->rot = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 128, 128);
+    ggml_set_input(inp->rot);
+    ggml_set_name(inp->rot, "escha_rot");
+
+    escha_rot = inp->rot;
+
+    res->add_input(std::move(inp));
+
+    return escha_rot;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+    if (w->type == GGML_TYPE_ESCHAM_2 || w->type == GGML_TYPE_ESCHAM_3) {
+        // escha projection: mul(escha_in) -> T128 -> mul_mat -> T128 -> mul(escha_out)
+        // no bias here: the standard model bias is added by the caller.
+        // rout is diagonal and T128 is dense per 128-block: they do not commute,
+        // so this order is the whole correctness of the port.
+        const auto it = escha->find(w);
+        if (it == escha->end()) {
+            GGML_ABORT("%s: escha weight without auxiliaries\n", w->name);
+        }
+        GGML_ASSERT(w_s == nullptr);
+
+        // both Hadamards reshape to (128, -1), so a 128-block must stay inside
+        // one token's vector. All escha shapes satisfy this; a future one may not.
+        GGML_ASSERT(w->ne[0] % 128 == 0);
+        GGML_ASSERT(w->ne[1] % 128 == 0);
+
+        ggml_tensor * rot = build_escha_rot();
+
+        cur = ggml_mul(ctx0, cur, it->second.in);
+        cur = llama_mul_mat_hadamard(ctx0, cur, rot);
+
+        ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+        // if this ever fails, llama_mul_mat_hadamard would silently ggml_cont_2d
+        // across token boundaries and still return a plausible number
+        GGML_ASSERT(ggml_is_contiguous(res));
+        res = llama_mul_mat_hadamard(ctx0, res, rot);
+        res = ggml_mul(ctx0, res, it->second.out);
+
+        for (const auto & lora : *loras) {
+            if (lora.first->get_weight(w)) {
+                GGML_ABORT("%s: lora on an escha weight is not supported\n", w->name);
+            }
+        }
+
+        return res;
+    }
+
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
     if (w_s) {

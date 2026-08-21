@@ -2,6 +2,8 @@
 
 #include "ggml.h" // for ggml_log_level
 
+#include <cmath>
+#include <cstring>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -72,6 +74,29 @@ static inline ggml_tensor * llama_mul_mat_hadamard(
     res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
 
     return res;
+}
+
+// orthonormal Walsh-Hadamard matrix H/sqrt(n), row-major, n a power of two.
+// note: H == H^T and H*H == I. Same construction as llama_kv_cache's, needed
+// here for the escha T128 transform, which has no kv-cache to hang off.
+static inline void llama_gen_hadamard_f32(float * data, int n) {
+    GGML_ASSERT(n > 0 && (n & (n - 1)) == 0);
+
+    std::memset(data, 0, sizeof(float)*(size_t)n*n);
+
+    data[0] = 1.0f/std::sqrt((float) n);
+
+    for (int s = 1; s < n; s *= 2) {
+        for (int i = 0; i < s; i++) {
+            for (int j = 0; j < s; j++) {
+                const float val = data[i*n + j];
+
+                data[(i + s)*n + (j    )] =  val;
+                data[(i    )*n + (j + s)] =  val;
+                data[(i + s)*n + (j + s)] = -val;
+            }
+        }
+    }
 }
 
 struct time_meas {

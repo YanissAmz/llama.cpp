@@ -2463,6 +2463,8 @@ llm_graph_params llama_context::graph_params(
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
+        /*.escha       =*/ &model.escha,
+        /*.escha_rot_src =*/ &model.escha_rot,
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,

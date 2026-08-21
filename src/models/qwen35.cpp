@@ -100,6 +100,19 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_gate_b = create_tensor(tn(LLM_TENSOR_FFN_GATE, "bias", il), { n_ff   }, TENSOR_NOT_REQUIRED);
         layer.ffn_down_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "bias", il), { n_embd }, TENSOR_NOT_REQUIRED);
         layer.ffn_up_b   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias", il), { n_ff   }, TENSOR_NOT_REQUIRED);
+
+        // escha auxiliaries, for whichever of these projections are coded.
+        // no-ops on a non-escha file, so this stays a single code path.
+        create_tensor_escha(layer.wq,        LLM_TENSOR_ATTN_Q,    il);
+        create_tensor_escha(layer.wk,        LLM_TENSOR_ATTN_K,    il);
+        create_tensor_escha(layer.wv,        LLM_TENSOR_ATTN_V,    il);
+        create_tensor_escha(layer.wqkv,      LLM_TENSOR_ATTN_QKV,  il);
+        create_tensor_escha(layer.wqkv_gate, LLM_TENSOR_ATTN_GATE, il);
+        create_tensor_escha(layer.wo,        LLM_TENSOR_ATTN_OUT,  il);
+        create_tensor_escha(layer.ssm_out,   LLM_TENSOR_SSM_OUT,   il);
+        create_tensor_escha(layer.ffn_gate,  LLM_TENSOR_FFN_GATE,  il);
+        create_tensor_escha(layer.ffn_down,  LLM_TENSOR_FFN_DOWN,  il);
+        create_tensor_escha(layer.ffn_up,    LLM_TENSOR_FFN_UP,    il);
     };
 
     auto load_block_mtp = [&](int il) {

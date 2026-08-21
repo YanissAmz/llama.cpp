@@ -674,6 +674,12 @@ struct llama_model {
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
+    // escha (QTIP) coded projections: weight -> its rin/rout auxiliaries, and
+    // the 128x128 Hadamard the T128 transform needs, kept in host memory
+    llama_escha_map    escha;
+    std::vector<float> escha_rot;
+
+
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 
@@ -771,6 +777,10 @@ struct llama_model_base : public llama_model {
                 int64_t n_ff_, int64_t n_expert_, int flags);
 
     // helper: try to load merged qkv first, fall back to separate q, k, v
+    // registers <name>.escha_in / <name>.escha_out for a coded weight.
+    // no-op if w is not an escha type, so callers can pass every projection.
+    void create_tensor_escha(ggml_tensor * w, llm_tensor tensor, int bid);
+
     void create_tensor_qkv(llama_layer & layer, int bid,
                 int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
                 int flags);

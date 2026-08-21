@@ -2940,6 +2940,26 @@ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, 
     }
 }
 
+void llama_model_base::create_tensor_escha(ggml_tensor * w, llm_tensor tensor, int bid) {
+    if (!w || (w->type != GGML_TYPE_ESCHAM_2 && w->type != GGML_TYPE_ESCHAM_3)) {
+        return;
+    }
+
+    const LLM_TN tn(arch);
+
+    // ne = (IC, OC): the input vector spans IC, the output vector spans OC
+    llama_escha_aux aux;
+    aux.in  = create_tensor(tn(tensor, "escha_in",  bid), { w->ne[0] }, 0);
+    aux.out = create_tensor(tn(tensor, "escha_out", bid), { w->ne[1] }, 0);
+
+    escha[w] = aux;
+
+    if (escha_rot.empty()) {
+        escha_rot.resize(128*128);
+        llama_gen_hadamard_f32(escha_rot.data(), 128);
+    }
+}
+
 void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
         int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
         int flags) {

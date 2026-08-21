@@ -6,6 +6,7 @@
 #include "llama-adapter.h"
 
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 #include <memory>
 #include <set>
@@ -18,6 +19,16 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+
+// escha auxiliary vectors for one coded weight.
+// in [IC] is applied element-wise before the T128 transform, out [OC] after it:
+//   mul(in) -> T128 -> mul_mat -> T128 -> mul(out)
+struct llama_escha_aux {
+    ggml_tensor * in  = nullptr;
+    ggml_tensor * out = nullptr;
+};
+
+using llama_escha_map = std::unordered_map<const ggml_tensor *, llama_escha_aux>;
 
 struct llama_memory_context_i;
 
@@ -121,6 +132,26 @@ protected:
 };
 
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
+
+// the 128x128 Walsh-Hadamard matrix used by the escha T128 transform.
+// one instance per graph, shared by every coded projection: a constant, so the
+// graph can always be reused.
+class llm_graph_input_escha_rot : public llm_graph_input_i {
+public:
+    llm_graph_input_escha_rot(const std::vector<float> & src) : src(src) {}
+    virtual ~llm_graph_input_escha_rot() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override {
+        GGML_UNUSED(params);
+        return true;
+    }
+
+    ggml_tensor * rot = nullptr; // F32 [128, 128]
+
+    const std::vector<float> & src;
+};
 
 class llm_graph_input_embd : public llm_graph_input_i {
 public:
@@ -750,6 +781,8 @@ struct llm_graph_params {
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
+    const llama_escha_map        * escha;
+    const std::vector<float>     * escha_rot_src;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
@@ -846,6 +879,7 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
+            escha == other.escha &&
             cross == other.cross;
     }
 };
@@ -990,12 +1024,17 @@ struct llm_graph_context {
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
+    const llama_escha_map        * escha;
+    const std::vector<float>     * escha_rot_src;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
+
+    // built on first use by build_lora_mm, shared by all coded projections
+    mutable ggml_tensor * escha_rot = nullptr;
 
     llm_graph_result * res;
 
@@ -1016,6 +1055,8 @@ struct llm_graph_context {
                      int   il) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
+    ggml_tensor * build_escha_rot() const;
+
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,
