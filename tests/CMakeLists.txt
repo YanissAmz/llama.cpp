@@ -121,6 +121,13 @@ llama_build(test-tokenizer-0.cpp)
 
 llama_build_and_test(test-escha-m4.c)
 llama_build_and_test(test-escha-m5.c)
+llama_build_and_test(test-escha-m5c.cpp)
+if (GGML_CUDA)
+    target_link_libraries(test-escha-m5c PRIVATE ggml-cuda)
+    if (UNIX AND NOT APPLE)
+        target_link_options(test-escha-m5c PRIVATE "LINKER:--no-as-needed")
+    endif()
+endif()
 
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-bert-bge          ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-command-r         ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-command-r.gguf)

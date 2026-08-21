@@ -67,6 +67,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/escham.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -1813,6 +1814,14 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (ggml_cuda_escham_supports_type(src0->type)) {
+        if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            ggml_cuda_escham_mul_mat(ctx, src0, src1, dst);
+            return;
+        }
+        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        return;
+    }
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
@@ -4970,6 +4979,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
+                    case GGML_TYPE_ESCHAM_2:
+                    case GGML_TYPE_ESCHAM_3:
                         return true;
                     default:
                         return false;
