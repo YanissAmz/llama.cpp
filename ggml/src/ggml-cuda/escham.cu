@@ -259,33 +259,52 @@ escham_kernel_fast(const uint16_t * __restrict__ codes,
 #pragma unroll
     for (int u = 0; u < NJ; ++u) { accA[u] = 0.f; accB[u] = 0.f; }
 
-    for (int t = t_begin + warp; t < t_end; t += nwarps) {
-        uint32_t wrd = 0;
-        if (lane < NW) {
-            const int idx = t*TILE_U16 + lane*2;
-            wrd = (uint32_t)band_codes[idx] | ((uint32_t)band_codes[idx+1] << 16);
-        }
-        const uint64_t pair = ((uint64_t)__shfl_sync(0xffffffffu, wrd, prv) << 32)
-                            |  (uint64_t)__shfl_sync(0xffffffffu, wrd, cur);
+    // UNR tuiles par iteration. Les chargements des UNR tuiles sont emis avant
+    // toute utilisation : la chaine charge -> shuffle -> decode -> FMA est
+    // entierement dependante, un seul flux en vol laisserait le warp bloque sur
+    // la latence memoire. Les bornes ne dependent que de (t, q, nwarps), donc
+    // elles sont uniformes sur le warp et les __shfl_sync restent legitimes.
+    const int rows[4] = { r0+9, r0+8, r0+1, r0+0 };
+    const int UNR = 2;
 
-        float wv[8];
+    for (int t = t_begin + warp; t < t_end; t += UNR*nwarps) {
+        uint32_t wrd[UNR];
+        float    xv [UNR][NJ];
 #pragma unroll
-        for (int s = 0; s < 8; ++s) {
-            const uint16_t win = (uint16_t)((pair >> (sh + (K3?3:2)*s)) & 0xffffu);
-            wv[s] = escham_decode(win);
+        for (int q = 0; q < UNR; ++q) {
+            const int tq = t + q*nwarps;
+            const bool live = tq < t_end;
+            wrd[q] = 0;
+            if (live && lane < NW) {
+                const int idx = tq*TILE_U16 + lane*2;
+                wrd[q] = (uint32_t)band_codes[idx] | ((uint32_t)band_codes[idx+1] << 16);
+            }
+#pragma unroll
+            for (int u = 0; u < NJ; ++u) {
+                const int j = j0 + u;
+                // lane l detient x[tq*16 + l] ; les autres se servent par shuffle.
+                xv[q][u] = (live && j < nc) ? x[(int64_t)j*ic + tq*16 + (lane & 15)] : 0.f;
+            }
         }
 
-        const int rows[4] = { r0+9, r0+8, r0+1, r0+0 };
 #pragma unroll
-        for (int u = 0; u < NJ; ++u) {
-            const int j = j0 + u;
-            // lane l detient x[t*16 + l] ; les autres se servent par shuffle.
-            const float xv = (j < nc) ? x[(int64_t)j*ic + t*16 + (lane & 15)] : 0.f;
+        for (int q = 0; q < UNR; ++q) {
+            const uint64_t pair = ((uint64_t)__shfl_sync(0xffffffffu, wrd[q], prv) << 32)
+                                |  (uint64_t)__shfl_sync(0xffffffffu, wrd[q], cur);
+            float wv[8];
 #pragma unroll
-            for (int s = 0; s < 4; ++s) {
-                const float xr = __shfl_sync(0xffffffffu, xv, rows[s]);
-                accB[u] += wv[s]   * xr;
-                accA[u] += wv[s+4] * xr;
+            for (int s = 0; s < 8; ++s) {
+                const uint16_t win = (uint16_t)((pair >> (sh + (K3?3:2)*s)) & 0xffffu);
+                wv[s] = escham_decode(win);
+            }
+#pragma unroll
+            for (int u = 0; u < NJ; ++u) {
+#pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    const float xr = __shfl_sync(0xffffffffu, xv[q][u], rows[s]);
+                    accB[u] += wv[s]   * xr;
+                    accA[u] += wv[s+4] * xr;
+                }
             }
         }
     }
