@@ -13,6 +13,7 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
+#include "ggml-escham.h"
 #include "common.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -1271,6 +1272,79 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+
+// ESCHAM tile-aware matmul. The atomic unit is a 16x16 tile shared by 16
+// output rows, so there is no per-row block and no vec_dot: decode one band
+// of 16 output channels once, then use it for all its rows and all columns.
+// src0: ne = (IC, OC), bytes band-major (OC/16, IC/16, 16*K) int16.
+static void ggml_compute_forward_mul_mat_escham(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src1));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
+    GGML_ASSERT(src1->ne[2] == 1 && src1->ne[3] == 1);
+
+    const int64_t ic = src0->ne[0];
+    const int64_t oc = src0->ne[1];
+    const int64_t nc = src1->ne[1];          // columns (tokens)
+    GGML_ASSERT(src1->ne[0] == ic);
+    GGML_ASSERT(dst->ne[0] == oc && dst->ne[1] == nc);
+    GGML_ASSERT(ic % 16 == 0 && oc % 16 == 0);
+
+    const int      k3      = src0->type == GGML_TYPE_ESCHAM_3;
+    const int64_t  ntiles  = ic / 16;        // IC tiles in one band
+    const int64_t  nbands  = oc / 16;
+    const size_t   tile_u16 = (size_t)(k3 ? 48 : 32);
+
+    const uint16_t * codes = (const uint16_t *) src0->data;
+    const float    * x     = (const float    *) src1->data;
+    float          * y     = (float          *) dst->data;
+
+    // one band decoded dense: (IC, 16) fp16, 160 KiB at IC=5120
+    uint16_t * wb = (uint16_t *) malloc((size_t)ic * 16 * sizeof(uint16_t));
+    if (!wb) {
+        GGML_ABORT("escham: out of memory for the band buffer");
+    }
+
+    for (int64_t b = params->ith; b < nbands; b += params->nth) {
+        const uint16_t * band = codes + (size_t)b * ntiles * tile_u16;
+        for (int64_t t = 0; t < ntiles; t++) {
+            // tile rows are IC-local, tile cols are the band's 16 outputs
+            if (k3) {
+                escham_decode_tile_k3(band + (size_t)t * tile_u16, wb + t * 256);
+            } else {
+                escham_decode_tile_k2(band + (size_t)t * tile_u16, wb + t * 256);
+            }
+        }
+        for (int64_t j = 0; j < nc; j++) {
+            const float * xj = x + j * ic;
+            float acc[16] = { 0 };
+            for (int64_t i = 0; i < ic; i++) {
+                const float xv = xj[i];
+                if (xv == 0.0f) {
+                    continue;
+                }
+                const uint16_t * wr = wb + i * 16;
+                for (int o = 0; o < 16; o++) {
+                    acc[o] += GGML_CPU_FP16_TO_FP32(wr[o]) * xv;
+                }
+            }
+            float * yj = y + j * oc + b * 16;
+            for (int o = 0; o < 16; o++) {
+                yj[o] = acc[o];
+            }
+        }
+    }
+
+    free(wb);
+}
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1281,6 +1355,11 @@ void ggml_compute_forward_mul_mat(
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
         ggml_compute_forward_fwht(params, dst);
+        return;
+    }
+
+    if (src0->type == GGML_TYPE_ESCHAM_2 || src0->type == GGML_TYPE_ESCHAM_3) {
+        ggml_compute_forward_mul_mat_escham(params, dst);
         return;
     }
 

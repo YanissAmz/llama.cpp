@@ -120,6 +120,7 @@ endfunction()
 llama_build(test-tokenizer-0.cpp)
 
 llama_build_and_test(test-escha-m4.c)
+llama_build_and_test(test-escha-m5.c)
 
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-bert-bge          ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-command-r         ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-command-r.gguf)
