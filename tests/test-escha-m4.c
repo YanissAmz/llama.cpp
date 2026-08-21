@@ -216,22 +216,13 @@ static int test_record(const char *name, int K, int IC, int OC, int NT, int NR,
     ggml_build_forward_expand(gf, res);
     ggml_backend_t cpu = ggml_backend_cpu_init();
     if (!cpu) { fprintf(stderr, "%s: no cpu backend\n", name); ggml_free(ctx); return 1; }
-    const char *nth_env = getenv("ESCHAM_M4_NTH");
-    ggml_backend_cpu_set_n_threads(cpu, nth_env ? atoi(nth_env) : 4);
+    ggml_backend_cpu_set_n_threads(cpu, 4);
     enum ggml_status gst = ggml_backend_graph_compute(cpu, gf);
     if (gst != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "%s: graph compute failed (%d)\n", name, (int)gst);
         fails++;
     }
     ggml_backend_free(cpu);
-
-    if (getenv("ESCHAM_M4_DUMP")) {
-        FILE *fd = fopen(getenv("ESCHAM_M4_DUMP"), "wb");
-        if (fd) {
-            fwrite(res->data, sizeof(float), (size_t)oc * nr, fd);
-            fclose(fd);
-        }
-    }
 
     // res is (OC, NR) in ggml order (data[j*oc + o]); the fixture stream is
     // row-major over (OC, NR): ref[o*nr + j]. Reorder before comparing.
@@ -281,8 +272,8 @@ static int test_record(const char *name, int K, int IC, int OC, int NT, int NR,
         }
         printf("  xp[0,0..7]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
                d_xp[0], d_xp[1], d_xp[2], d_xp[3], d_xp[4], d_xp[5], d_xp[6], d_xp[7]);
-        printf("  z[o,0] o0-3 : %.6f %.6f %.6f %.6f\n",
-               d_z[0], d_z[nr], d_z[2 * nr], d_z[3 * nr]);
+        printf("  z[0,j] j0-3 : %.6f %.6f %.6f %.6f\n",
+               d_z[0], d_z[1], d_z[2], d_z[3]);
         printf("  WhC[0,0..1]=(%.6f,%.6f) WhC[1,0]=%.6f WhC[100,37]=%.6f\n",
                ggml_fp16_to_fp32(whc[0 * oc + 0]), ggml_fp16_to_fp32(whc[0 * oc + 1]),
                ggml_fp16_to_fp32(whc[1 * oc + 0]), ggml_fp16_to_fp32(whc[100 * oc + 37]));
@@ -301,11 +292,13 @@ static int test_record(const char *name, int K, int IC, int OC, int NT, int NR,
                 printf(" %.6f/%.6f", d_z[o * nr], (float)acc);
             }
             printf("\n");
-            // integrity: tw must still hold whc after the graph run
+            // integrity: tw must still hold the transposed Wh after the graph run
             size_t diff = 0;
             const uint16_t *twv = (const uint16_t *)tw->data;
-            for (size_t i = 0; i < (size_t)ic * oc; i++) {
-                if (twv[i] != whc[i]) diff++;
+            for (int64_t i = 0; i < ic; i++) {
+                for (int64_t o = 0; o < oc; o++) {
+                    if (twv[o * ic + i] != whc[i * oc + o]) diff++;
+                }
             }
             printf("  tw cells differing from whc after compute: %zu\n", diff);
             // primitive checks: from_float conversion and vec_dot_f16 accuracy

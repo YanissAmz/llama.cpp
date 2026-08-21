@@ -756,17 +756,23 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_mxfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp4_ref,
     },
-    // ESCHAM tiles: one 16x16 weight tile per block (decision D1/D2, no kernel yet)
+    // ESCHAM tiles. The atomic unit is a 16x16 tile (16*K int16 -> 256 fp16),
+    // shared by 16 output rows, so no block is row-local and there is no
+    // to_float / vec_dot: mul_mat takes a tile-aware branch instead.
+    // blck_size 16 (not 256) so that ggml_row_size stays exact for any IC
+    // divisible by 16 -- the only divisibility the format itself guarantees.
+    // Row size = 2*K * IC/16 bytes; a band of 16 rows is exactly its IC/16
+    // tiles. Data is stored band-major: (OC/16, IC/16, 16*K) int16.
     [GGML_TYPE_ESCHAM_2] = {
         .type_name                = "escham_2",
-        .blck_size                = 256,
-        .type_size                = 64,   // 16*K int16, K=2
+        .blck_size                = 16,
+        .type_size                = 4,    // 2*K bytes per 16 weights, K=2
         .is_quantized             = true,
     },
     [GGML_TYPE_ESCHAM_3] = {
         .type_name                = "escham_3",
-        .blck_size                = 256,
-        .type_size                = 96,   // 16*K int16, K=3
+        .blck_size                = 16,
+        .type_size                = 6,    // 2*K bytes per 16 weights, K=3
         .is_quantized             = true,
     },
     [GGML_TYPE_NVFP4] = {
@@ -3301,6 +3307,10 @@ struct ggml_tensor * ggml_mul_mat(
     result->op     = GGML_OP_MUL_MAT;
     result->src[0] = a;
     result->src[1] = b;
+
+    // op params come from the pool and are not zeroed; the CPU backend reads
+    // the hint and would silently take the FWHT path on stale bytes
+    ggml_set_op_params_i32(result, 1, GGML_HINT_NONE);
 
     return result;
 }
