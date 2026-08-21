@@ -67,9 +67,12 @@ static inline uint16_t escham_fp32_to_fp16_host(float f){
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ float escham_decode(uint16_t win){
     const uint32_t t = ((uint32_t)win * ESCHAM_MUL1 & ESCHAM_MASK) ^ ESCHAM_MAGIC;
-    const float lo = __half2float(__ushort_as_half((unsigned short)(t & 0xffffu)));
-    const float hi = __half2float(__ushort_as_half((unsigned short)(t >> 16)));
-    return __half2float(__float2half_rn(lo + hi));
+    // addition directement en fp16 : trois instructions de moins que
+    // convertir-additionner-rearrondir, et bit-identique. Verifie sur les
+    // 65536 fenetres : aucun NaN, aucun subnormal, et l'addition fp16 rend
+    // exactement les memes bits que la somme fp32 arrondie au plus proche pair.
+    return __half2float(__hadd(__ushort_as_half((unsigned short)(t & 0xffffu)),
+                               __ushort_as_half((unsigned short)(t >> 16))));
 }
 
 // device constant tables (small)
