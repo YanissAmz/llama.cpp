@@ -46,27 +46,27 @@ static int test_one(struct Case c){
     float *y_cuda=(float*)malloc((size_t)c.OC*c.NR*sizeof(float));
     if(!y_cpu||!y_cuda){ free(band); free(xp); free(y_cpu); free(y_cuda); return 1; }
 
-    auto run_backend=[&](ggml_backend_t be, float *out)->int{
-        size_t pool=(size_t)itc*otc*tile_u16*2 + (size_t)(c.IC+c.OC)*c.NR*4*4 + 64ull*1024*1024;
+    auto run_backend=[&](ggml_backend_t be, float *out, int64_t nr)->int{
+        size_t pool=(size_t)itc*otc*tile_u16*2 + (size_t)(c.IC+c.OC)*nr*4*4 + 64ull*1024*1024;
         struct ggml_init_params ip={pool,NULL,false};
         struct ggml_context *ctx=ggml_init(ip);
         struct ggml_tensor *tw=ggml_new_tensor_2d(ctx, (c.K==3)?GGML_TYPE_ESCHAM_3:GGML_TYPE_ESCHAM_2, c.IC, c.OC);
         if(ggml_nbytes(tw)!=(size_t)itc*otc*tile_u16*sizeof(uint16_t)){ fprintf(stderr,"bytes mismatch\n"); ggml_free(ctx); return 1; }
         memcpy(tw->data, band, ggml_nbytes(tw));
-        struct ggml_tensor *txp=ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.IC, c.NR);
-        memcpy(txp->data, xp, (size_t)c.IC*c.NR*sizeof(float));
+        struct ggml_tensor *txp=ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.IC, nr);
+        memcpy(txp->data, xp, (size_t)c.IC*nr*sizeof(float));
         struct ggml_tensor *z=ggml_mul_mat(ctx, tw, txp);
         struct ggml_cgraph *gf=ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, z);
         enum ggml_status st=ggml_backend_graph_compute(be, gf);
         if(st!=GGML_STATUS_SUCCESS){ fprintf(stderr,"graph compute failed %d\n",(int)st); ggml_free(ctx); return 1; }
-        for(int64_t j=0;j<c.NR;++j){ float *col=(float*)z->data+j*c.OC; escham_vec_had128_f32(col,c.OC); for(int64_t o=0;o<c.OC;++o) out[o*c.NR+j]=col[o]*c.rout[o]+c.bias[o]; }
+        for(int64_t j=0;j<nr;++j){ float *col=(float*)z->data+j*c.OC; escham_vec_had128_f32(col,c.OC); for(int64_t o=0;o<c.OC;++o) out[o*nr+j]=col[o]*c.rout[o]+c.bias[o]; }
         ggml_free(ctx);
         return 0;
     };
 
     ggml_backend_t cpu=ggml_backend_cpu_init();
-    int rc=run_backend(cpu,y_cpu);
+    int rc=run_backend(cpu,y_cpu,c.NR);
     ggml_backend_free(cpu);
     if(rc){ free(band); free(xp); free(y_cpu); free(y_cuda); return 1; }
     float rms_ref=rel_rms(y_cpu, c.ref_y, (size_t)c.OC*c.NR);
@@ -86,15 +86,31 @@ static int test_one(struct Case c){
     // ggml-cuda is linked (see ldd) — call directly; weak check was dropping the symbol due to --as-needed elision
     cuda_be=ggml_backend_cuda_init(0); have_cuda=cuda_be!=nullptr;
     if(have_cuda){
-        rc=run_backend(cuda_be,y_cuda);
+        rc=run_backend(cuda_be,y_cuda,c.NR);
+        // nc==1 : chemin de generation de token (NJ=1 dans le kernel rapide).
+        // Il n'est atteint par aucun autre test : le harnais tourne a NR=4 et
+        // logit_dump decode tout le prompt en un seul llama_decode.
+        float rms_nc1=-1.f;
+        if(!rc){
+            float *y1=(float*)malloc((size_t)c.OC*sizeof(float));
+            if(!y1){ rc=1; }
+            else if(run_backend(cuda_be,y1,1)){ rc=1; free(y1); }
+            else {
+                float *ref1=(float*)malloc((size_t)c.OC*sizeof(float));
+                for(int64_t o=0;o<c.OC;++o) ref1[o]=y_cpu[o*c.NR];
+                rms_nc1=rel_rms(y1, ref1, (size_t)c.OC);
+                free(ref1); free(y1);
+            }
+        }
         ggml_backend_free(cuda_be);
         if(rc){ printf("%s: K=%d IC=%d OC=%d NR=%d  cpu_vs_ref %.3e  cuda FAIL\n", c.name,c.K,c.IC,c.OC,c.NR,rms_ref); free(band); free(xp); free(y_cpu); free(y_cuda); return 1; }
         float rms_cuda=rel_rms(y_cuda, c.ref_y, (size_t)c.OC*c.NR);
         float rms_cc=rel_rms(y_cuda, y_cpu, (size_t)c.OC*c.NR);
-        printf("%s: K=%d IC=%d OC=%d NR=%d  cpu_vs_ref %.3e  cuda_vs_ref %.3e  cpu_vs_cuda %.3e  %s\n",
-               c.name,c.K,c.IC,c.OC,c.NR,rms_ref,rms_cuda,rms_cc,(rms_cc<CRIT && rms_cuda<CRIT)?"OK":"FAIL");
+        bool ok=(rms_cc<CRIT && rms_cuda<CRIT && rms_nc1>=0.f && rms_nc1<CRIT);
+        printf("%s: K=%d IC=%d OC=%d NR=%d  cpu_vs_ref %.3e  cuda_vs_ref %.3e  cpu_vs_cuda %.3e  nc1_vs_cpu %.3e  %s\n",
+               c.name,c.K,c.IC,c.OC,c.NR,rms_ref,rms_cuda,rms_cc,rms_nc1,ok?"OK":"FAIL");
         free(band); free(xp); free(y_cpu); free(y_cuda);
-        return (rms_cc<CRIT && rms_cuda<CRIT)?0:1;
+        return ok?0:1;
     } else {
         printf("%s: K=%d IC=%d OC=%d NR=%d  cpu_vs_ref %.3e  cuda N/A  %s\n", c.name,c.K,c.IC,c.OC,c.NR,rms_ref,(rms_ref<CRIT)?"OK":"FAIL");
         free(band); free(xp); free(y_cpu); free(y_cuda);

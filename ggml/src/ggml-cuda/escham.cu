@@ -52,6 +52,26 @@ static inline uint16_t escham_fp32_to_fp16_host(float f){
     return (uint16_t)(s|r);
 }
 
+// ---------------------------------------------------------------------------
+// Decodage inline du codec (cb==1). Remplace la LUT de 65536 entrees fp32.
+//
+// Pourquoi : la LUT coutait 4 octets de lecture L2 par poids decode, contre
+// 0,31 octet de code. Elle deplacait ~13x plus de donnees que les poids
+// eux-memes, et les acces sont disperses sur 256 Kio -> aucune localite. A
+// ~24 G poids codes par token, cela plafonnait la generation vers 3,5 t/s.
+// Le codec tient en cinq instructions et zero acces memoire.
+//
+// Bit-exact avec la table construite par escham_cuda_init_tables : meme
+// somme en fp32, meme arrondi au plus proche pair vers fp16, meme retour
+// en fp32. __half2float est exact, __float2half_rn est RNE comme l'hote.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float escham_decode(uint16_t win){
+    const uint32_t t = ((uint32_t)win * ESCHAM_MUL1 & ESCHAM_MASK) ^ ESCHAM_MAGIC;
+    const float lo = __half2float(__ushort_as_half((unsigned short)(t & 0xffffu)));
+    const float hi = __half2float(__ushort_as_half((unsigned short)(t >> 16)));
+    return __half2float(__float2half_rn(lo + hi));
+}
+
 // device constant tables (small)
 __constant__ uint8_t c_tile_row[256];
 __constant__ uint8_t c_tile_col[256];
@@ -149,7 +169,7 @@ __global__ void escham_kernel(const uint16_t * codes, const float * x, float * y
             for(int s=0;s<8;++s){
                 int shift = (int)sh + (K3?3:2)*s;
                 uint16_t win = (uint16_t)((pair >> shift) & 0xffffu);
-                float w = lut[win];
+                float w = escham_decode(win);
                 int r = c_tile_row[m*8+s];
                 int c = c_tile_col[m*8+s];
                 s_tile[r*16 + c]=w;
@@ -252,7 +272,7 @@ escham_kernel_fast(const uint16_t * __restrict__ codes,
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             const uint16_t win = (uint16_t)((pair >> (sh + (K3?3:2)*s)) & 0xffffu);
-            wv[s] = lut[win];
+            wv[s] = escham_decode(win);
         }
 
         const int rows[4] = { r0+9, r0+8, r0+1, r0+0 };
