@@ -67,12 +67,14 @@ static inline uint16_t escham_fp32_to_fp16_host(float f){
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ float escham_decode(uint16_t win){
     const uint32_t t = ((uint32_t)win * ESCHAM_MUL1 & ESCHAM_MASK) ^ ESCHAM_MAGIC;
-    // addition directement en fp16 : trois instructions de moins que
-    // convertir-additionner-rearrondir, et bit-identique. Verifie sur les
-    // 65536 fenetres : aucun NaN, aucun subnormal, et l'addition fp16 rend
-    // exactement les memes bits que la somme fp32 arrondie au plus proche pair.
-    return __half2float(__hadd(__ushort_as_half((unsigned short)(t & 0xffffu)),
-                               __ushort_as_half((unsigned short)(t >> 16))));
+    // t EST un half2 : ses deux moities sont les deux fp16 a additionner.
+    // Les extraire par (t & 0xffff) et (t >> 16) coutait un LOP3 et un SHF,
+    // soit deux des ~4 instructions ALU par poids — et le pipe ALU est le
+    // goulot (69,8 % au ncu). HADD2 sait lire ses operandes en .H0_H0/.H1_H1
+    // sans aucune instruction entiere. Le resultat reste l'addition fp16,
+    // donc bit-identique a la table d'origine.
+    const __half2 h = *reinterpret_cast<const __half2 *>(&t);
+    return __half2float(__hadd(__low2half(h), __high2half(h)));
 }
 
 // device constant tables (small)
@@ -307,11 +309,21 @@ escham_kernel_fast(const uint16_t * __restrict__ codes,
         for (int q = 0; q < UNR; ++q) {
             const uint64_t pair = ((uint64_t)__shfl_sync(0xffffffffu, wrd[q], prv) << 32)
                                 |  (uint64_t)__shfl_sync(0xffffffffu, wrd[q], cur);
+            // Extraction 32 bits. Un decalage sur 64 bits coute deux
+            // instructions ALU (SHF.R.U64 + SHF.R.U32.HI) et le pipe ALU est
+            // le goulot (69,8 % au ncu). Les 8 fenetres d'une tuile tiennent
+            // dans une vue 32 bits pour K=2 (sh in {0,16}, bit max sh+29) et
+            // dans deux vues pour K=3 (sh in {0,8,24}, bit max sh+36) : un ou
+            // deux decalages 64 bits par tuile au lieu de huit.
+            const uint32_t v0 = (uint32_t)(pair >> sh);
+            const uint32_t v1 = K3 ? (uint32_t)(pair >> (sh + 18)) : 0u;
             float wv[8];
 #pragma unroll
             for (int s = 0; s < 8; ++s) {
-                const uint16_t win = (uint16_t)((pair >> (sh + (K3?3:2)*s)) & 0xffffu);
-                wv[s] = escham_decode(win);
+                uint32_t src; int off;
+                if (K3) { const bool hi = s >= 6; src = hi ? v1 : v0; off = 3*s - (hi ? 18 : 0); }
+                else    { src = v0; off = 2*s; }
+                wv[s] = escham_decode((uint16_t)((src >> off) & 0xffffu));
             }
             // rows[] = { r0+9, r0+8, r0+1, r0+0 } dans cet ordre
 #pragma unroll
