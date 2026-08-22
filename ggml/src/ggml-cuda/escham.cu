@@ -78,6 +78,14 @@ __device__ __forceinline__ float escham_decode(uint16_t win){
 }
 
 // device constant tables (small)
+// HIP ne mappe pas cudaMemcpyToSymbol dans vendors/hip.h (seuls cudaMemcpy et
+// ses variantes y figurent). Meme signature des deux cotes.
+#if defined(GGML_USE_HIP)
+#define ESCHAM_MEMCPY_TO_SYMBOL hipMemcpyToSymbol
+#else
+#define ESCHAM_MEMCPY_TO_SYMBOL cudaMemcpyToSymbol
+#endif
+
 __constant__ uint8_t c_tile_row[256];
 __constant__ uint8_t c_tile_col[256];
 __constant__ uint8_t c_cur2[32];
@@ -115,8 +123,8 @@ static void escham_cuda_init_tables(){
             h_col[m*8+s]=(uint8_t)(c0+off[s][1]+d);
         }
     }
-    CUDA_CHECK(cudaMemcpyToSymbol(c_tile_row, h_row, sizeof(h_row)));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_tile_col, h_col, sizeof(h_col)));
+    CUDA_CHECK(ESCHAM_MEMCPY_TO_SYMBOL(c_tile_row, h_row, sizeof(h_row)));
+    CUDA_CHECK(ESCHAM_MEMCPY_TO_SYMBOL(c_tile_col, h_col, sizeof(h_col)));
     uint8_t cur2[32], prev2[32], sh2[32];
     uint8_t cur3[32], prev3[32], sh3[32];
     for(int l=0;l<32;++l){
@@ -131,12 +139,12 @@ static void escham_cuda_init_tables(){
         prev3[l]=(uint8_t)(l==0?23:(((b+755)>>5)-24));
         sh3[l]=(uint8_t)(r87-b-760);
     }
-    CUDA_CHECK(cudaMemcpyToSymbol(c_cur2, cur2, sizeof(cur2)));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_prev2, prev2, sizeof(prev2)));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_sh2, sh2, sizeof(sh2)));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_cur3, cur3, sizeof(cur3)));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_prev3, prev3, sizeof(prev3)));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_sh3, sh3, sizeof(sh3)));
+    CUDA_CHECK(ESCHAM_MEMCPY_TO_SYMBOL(c_cur2, cur2, sizeof(cur2)));
+    CUDA_CHECK(ESCHAM_MEMCPY_TO_SYMBOL(c_prev2, prev2, sizeof(prev2)));
+    CUDA_CHECK(ESCHAM_MEMCPY_TO_SYMBOL(c_sh2, sh2, sizeof(sh2)));
+    CUDA_CHECK(ESCHAM_MEMCPY_TO_SYMBOL(c_cur3, cur3, sizeof(cur3)));
+    CUDA_CHECK(ESCHAM_MEMCPY_TO_SYMBOL(c_prev3, prev3, sizeof(prev3)));
+    CUDA_CHECK(ESCHAM_MEMCPY_TO_SYMBOL(c_sh3, sh3, sizeof(sh3)));
     g_inited=true;
 }
 
@@ -307,8 +315,11 @@ escham_kernel_fast(const uint16_t * __restrict__ codes,
 
 #pragma unroll
         for (int q = 0; q < UNR; ++q) {
-            const uint64_t pair = ((uint64_t)__shfl_sync(0xffffffffu, wrd[q], prv) << 32)
-                                |  (uint64_t)__shfl_sync(0xffffffffu, wrd[q], cur);
+            // La largeur est passee explicitement : vendors/hip.h definit
+            // __shfl_sync comme une macro a QUATRE arguments, l'omettre ne
+            // compile pas en HIP. Sous CUDA c'est la valeur par defaut.
+            const uint64_t pair = ((uint64_t)__shfl_sync(0xffffffffu, wrd[q], prv, WARP_SIZE) << 32)
+                                |  (uint64_t)__shfl_sync(0xffffffffu, wrd[q], cur, WARP_SIZE);
             // Extraction 32 bits. Un decalage sur 64 bits coute deux
             // instructions ALU (SHF.R.U64 + SHF.R.U32.HI) et le pipe ALU est
             // le goulot (69,8 % au ncu). Les 8 fenetres d'une tuile tiennent
@@ -341,10 +352,15 @@ escham_kernel_fast(const uint16_t * __restrict__ codes,
     // les 4 lanes d'un groupe (m>>2) visent le meme couple de colonnes
 #pragma unroll
     for (int u = 0; u < NJ; ++u) {
-        accA[u] += __shfl_down_sync(0xffffffffu, accA[u], 2, 4);
-        accB[u] += __shfl_down_sync(0xffffffffu, accB[u], 2, 4);
-        accA[u] += __shfl_down_sync(0xffffffffu, accA[u], 1, 4);
-        accB[u] += __shfl_down_sync(0xffffffffu, accB[u], 1, 4);
+        // Reduction papillon plutot que __shfl_down : HIP ne fournit pas d'alias
+        // a quatre arguments pour __shfl_down_sync, alors qu'il en a un pour
+        // __shfl_xor_sync. Sur une largeur de 4, xor donne la somme complete a
+        // TOUTES les lanes du groupe au lieu de la seule lane 0 ; le seul
+        // lecteur teste (lane & 3) == 0, donc le resultat est inchange.
+        accA[u] += __shfl_xor_sync(0xffffffffu, accA[u], 2, 4);
+        accB[u] += __shfl_xor_sync(0xffffffffu, accB[u], 2, 4);
+        accA[u] += __shfl_xor_sync(0xffffffffu, accA[u], 1, 4);
+        accB[u] += __shfl_xor_sync(0xffffffffu, accB[u], 1, 4);
     }
 
     // un seul atomicAdd global par (colonne, sortie) et par bloc
@@ -388,6 +404,13 @@ static void escham_launch_fast(const uint16_t * codes, const float * x, float * 
                                                      d_lut, tiles_per_chunk);
 }
 
+static __global__ void escham_zero_kernel(float * y, int64_t n){
+    for (int64_t i = (int64_t)blockIdx.x*blockDim.x + threadIdx.x; i < n;
+         i += (int64_t)gridDim.x*blockDim.x) {
+        y[i] = 0.f;
+    }
+}
+
 void ggml_cuda_escham_mul_mat_raw(const void * src0_data, const void * src1_data, void * dst_data,
                                   int64_t ic, int64_t oc, int64_t nc, int is_k3, void * stream){
     escham_cuda_init_tables();
@@ -400,7 +423,20 @@ void ggml_cuda_escham_mul_mat_raw(const void * src0_data, const void * src1_data
     dim3 block(16,4);
     dim3 grid((unsigned)nbands, (unsigned)((nc+3)/4));
     // le chemin rapide accumule : il faut partir de zero.
-    CUDA_CHECK(cudaMemsetAsync(y, 0, (size_t)nc*oc*sizeof(float), st));
+    // Mise a zero par noyau, pas par cudaMemsetAsync.
+    //
+    // Pourquoi : hipMemsetAsync refuse un pointeur qui n'est pas de la memoire
+    // peripherique — « invalid argument » — la ou un noyau ecrit sans probleme
+    // des que la memoire est mappee (constate sur gfx1151, hipPointerGetAttributes
+    // rendant type=0, non enregistre). CUDA tolere le meme cas par l'acces hote
+    // transparent du pilote NVIDIA. Un noyau marche des deux cotes ; le cout est
+    // negligeable devant le produit matriciel qui suit.
+    {
+        const int64_t n = nc*oc;
+        const int nb = (int)((n + 255)/256);
+        escham_zero_kernel<<<nb > 65535 ? 65535 : nb, 256, 0, st>>>(y, n);
+        CUDA_CHECK(cudaGetLastError());
+    }
     if(nc == 1){
         if(is_k3) escham_launch_fast<true , 1>(codes,x,y,ic,oc,nc,st);
         else      escham_launch_fast<false, 1>(codes,x,y,ic,oc,nc,st);

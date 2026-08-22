@@ -46,21 +46,32 @@ static int test_one(struct Case c){
     float *y_cuda=(float*)malloc((size_t)c.OC*c.NR*sizeof(float));
     if(!y_cpu||!y_cuda){ free(band); free(xp); free(y_cpu); free(y_cuda); return 1; }
 
+    // Les tenseurs sont alloues DANS le tampon du backend, pas dans un
+    // ggml_context hote. Avec des pointeurs hotes bruts le test ne passait sur
+    // CUDA que grace a l'acces transparent du pilote NVIDIA (HMM) ; ROCm sans
+    // XNACK refuse le meme acces et le noyau faute. Passer par le tampon du
+    // backend est de toute facon ce que fait llama.cpp en vrai.
     auto run_backend=[&](ggml_backend_t be, float *out, int64_t nr)->int{
-        size_t pool=(size_t)itc*otc*tile_u16*2 + (size_t)(c.IC+c.OC)*nr*4*4 + 64ull*1024*1024;
-        struct ggml_init_params ip={pool,NULL,false};
+        struct ggml_init_params ip={ ggml_tensor_overhead()*8 + ggml_graph_overhead(), NULL, true };
         struct ggml_context *ctx=ggml_init(ip);
         struct ggml_tensor *tw=ggml_new_tensor_2d(ctx, (c.K==3)?GGML_TYPE_ESCHAM_3:GGML_TYPE_ESCHAM_2, c.IC, c.OC);
         if(ggml_nbytes(tw)!=(size_t)itc*otc*tile_u16*sizeof(uint16_t)){ fprintf(stderr,"bytes mismatch\n"); ggml_free(ctx); return 1; }
-        memcpy(tw->data, band, ggml_nbytes(tw));
         struct ggml_tensor *txp=ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.IC, nr);
-        memcpy(txp->data, xp, (size_t)c.IC*nr*sizeof(float));
         struct ggml_tensor *z=ggml_mul_mat(ctx, tw, txp);
         struct ggml_cgraph *gf=ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, z);
+        ggml_backend_buffer_t buf=ggml_backend_alloc_ctx_tensors(ctx, be);
+        if(!buf){ fprintf(stderr,"alloc_ctx_tensors failed\n"); ggml_free(ctx); return 1; }
+        ggml_backend_tensor_set(tw,  band, 0, ggml_nbytes(tw));
+        ggml_backend_tensor_set(txp, xp,   0, (size_t)c.IC*nr*sizeof(float));
         enum ggml_status st=ggml_backend_graph_compute(be, gf);
-        if(st!=GGML_STATUS_SUCCESS){ fprintf(stderr,"graph compute failed %d\n",(int)st); ggml_free(ctx); return 1; }
-        for(int64_t j=0;j<nr;++j){ float *col=(float*)z->data+j*c.OC; escham_vec_had128_f32(col,c.OC); for(int64_t o=0;o<c.OC;++o) out[o*nr+j]=col[o]*c.rout[o]+c.bias[o]; }
+        if(st!=GGML_STATUS_SUCCESS){ fprintf(stderr,"graph compute failed %d\n",(int)st); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1; }
+        float *zh=(float*)malloc((size_t)c.OC*nr*sizeof(float));
+        if(!zh){ ggml_backend_buffer_free(buf); ggml_free(ctx); return 1; }
+        ggml_backend_tensor_get(z, zh, 0, (size_t)c.OC*nr*sizeof(float));
+        for(int64_t j=0;j<nr;++j){ float *col=zh+j*c.OC; escham_vec_had128_f32(col,c.OC); for(int64_t o=0;o<c.OC;++o) out[o*nr+j]=col[o]*c.rout[o]+c.bias[o]; }
+        free(zh);
+        ggml_backend_buffer_free(buf);
         ggml_free(ctx);
         return 0;
     };
@@ -71,14 +82,14 @@ static int test_one(struct Case c){
     if(rc){ free(band); free(xp); free(y_cpu); free(y_cuda); return 1; }
     float rms_ref=rel_rms(y_cpu, c.ref_y, (size_t)c.OC*c.NR);
 
-#if defined(GGML_USE_CUDA)
-#ifndef GGML_CUDA
+// ESCHA_TEST_GPU est pose par CMake quand un backend GPU (CUDA ou HIP) est
+// effectivement lie a la cible. GGML_USE_CUDA seul ne suffit pas : la
+// construction HIP le definit aussi, mais une cible non liee n'aurait pas le
+// symbole.
+#if defined(ESCHA_TEST_GPU)
 #define GGML_CUDA 1
-#endif
 #else
-#ifndef GGML_CUDA
 #define GGML_CUDA 0
-#endif
 #endif
 #if GGML_CUDA
     ggml_backend_t cuda_be=nullptr;
@@ -112,9 +123,11 @@ static int test_one(struct Case c){
         free(band); free(xp); free(y_cpu); free(y_cuda);
         return ok?0:1;
     } else {
-        printf("%s: K=%d IC=%d OC=%d NR=%d  cpu_vs_ref %.3e  cuda N/A  %s\n", c.name,c.K,c.IC,c.OC,c.NR,rms_ref,(rms_ref<CRIT)?"OK":"FAIL");
+        // Le backend est lie mais ne s'initialise pas : c'est un echec du test,
+        // pas un cas "non applicable". Sinon un bras GPU muet passerait.
+        printf("%s: K=%d IC=%d OC=%d NR=%d  cpu_vs_ref %.3e  gpu INIT FAIL\n", c.name,c.K,c.IC,c.OC,c.NR,rms_ref);
         free(band); free(xp); free(y_cpu); free(y_cuda);
-        return (rms_ref<CRIT)?0:1;
+        return 1;
     }
 #else
     printf("%s: K=%d IC=%d OC=%d NR=%d  cpu_vs_ref %.3e  cuda N/A (GGML_CUDA=OFF)  %s\n", c.name,c.K,c.IC,c.OC,c.NR,rms_ref,(rms_ref<CRIT)?"OK":"FAIL");

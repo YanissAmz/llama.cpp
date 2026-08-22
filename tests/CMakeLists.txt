@@ -122,8 +122,16 @@ llama_build(test-tokenizer-0.cpp)
 llama_build_and_test(test-escha-m4.c)
 llama_build_and_test(test-escha-m5.c)
 llama_build_and_test(test-escha-m5c.cpp)
-if (GGML_CUDA)
-    target_link_libraries(test-escha-m5c PRIVATE ggml-cuda)
+if (GGML_CUDA OR GGML_HIP)
+    if (GGML_CUDA)
+        target_link_libraries(test-escha-m5c PRIVATE ggml-cuda)
+    else()
+        target_link_libraries(test-escha-m5c PRIVATE ggml-hip)
+    endif()
+    # Le backend GPU est lie explicitement : si son init echoue a l'execution,
+    # le test doit ECHOUER et non passer sur le seul bras CPU. Sans ce garde-fou
+    # une construction HIP cassee afficherait "cuda N/A" puis "PASS".
+    target_compile_definitions(test-escha-m5c PRIVATE ESCHA_TEST_GPU=1)
     if (UNIX AND NOT APPLE)
         target_link_options(test-escha-m5c PRIVATE "LINKER:--no-as-needed")
     endif()
