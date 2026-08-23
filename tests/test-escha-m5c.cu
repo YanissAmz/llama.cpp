@@ -12,7 +12,7 @@
 #include <string.h>
 #include <stdint.h>
 
-#define FIXTURE_DEFAULT "/home/yaniss/hermes-work/escha/port/fixture_m4.bin"
+#define FIXTURE_DEFAULT "fixture_m4.bin"
 #define FIXTURE_MAGIC 0x45534D34u
 #define CRIT 1e-3f
 
@@ -115,7 +115,8 @@ static int test_one(struct Case c){
     }
 }
 int main(int argc,char**argv){
-    const char *path= argc>1?argv[1]:FIXTURE_DEFAULT;
+    const char *env = getenv("ESCHA_FIXTURE");
+    const char *path = argc>1 ? argv[1] : (env && env[0]) ? env : FIXTURE_DEFAULT;
     size_t n=0; uint8_t *buf=(uint8_t*)read_all(path,&n); if(!buf) return 1; cur=buf;
     if(rd_u32()!=FIXTURE_MAGIC){ fprintf(stderr,"bad magic\n"); return 1; }
     (void)rd_u32(); uint32_t nrec=rd_u32();

@@ -28,6 +28,7 @@ non-quantized: F32.
 
 Change the quant type ids in ONE place: ESCHA_TYPE_ID below.
 """
+import os
 import argparse
 import json
 import random
@@ -39,7 +40,7 @@ from pathlib import Path
 import numpy as np
 from safetensors import safe_open
 
-GGUF_PY = Path("/home/yaniss/lab/llamacpp-q38-master/gguf-py")
+GGUF_PY = Path(os.environ.get("GGUF_PY", Path(__file__).resolve().parents[2] / "gguf-py"))
 sys.path.insert(0, str(GGUF_PY))
 import gguf  # noqa: E402
 
@@ -47,7 +48,7 @@ PORT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PORT))
 import escham_cpu  # noqa: E402
 
-CKPT_DIR = Path("/home/yaniss/models/qwen3.8-27b-escha-w2")  # brief said w/, but
+CKPT_DIR = Path(os.environ.get("ESCHA_CKPT", "./escha-w2"))  # brief said w/, but
 # w/ holds only the escha+sglang CODE trees; the weights repo is flat, here.
 DEFAULT_OUT = PORT / "escha-qwen35.gguf"
 ARCH = "qwen35"
@@ -264,7 +265,7 @@ def gguf_name(key: str) -> str:
 # ---------------------------------------------------------------------------
 # Metadata (mirrors conversion/qwen.py :: Qwen3_5ForConditionalGeneration)
 # ---------------------------------------------------------------------------
-ORACLE = Path("/home/yaniss/models/qwen3.8-27b-escha-gguf/escha-oracle-q8_0.gguf")
+ORACLE = Path(os.environ.get("ESCHA_ORACLE", "./escha-oracle-q8_0.gguf"))
 
 
 def set_metadata(w: "gguf.GGUFWriter", cp: Checkpoint, codebooks=()):

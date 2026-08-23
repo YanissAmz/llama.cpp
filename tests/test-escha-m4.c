@@ -23,7 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define FIXTURE_DEFAULT "/home/yaniss/hermes-work/escha/port/fixture_m4.bin"
+#define FIXTURE_DEFAULT "fixture_m4.bin"
 #define FIXTURE_MAGIC 0x45534D34u // 'ESM4'
 // (a) is bitwise: any mismatched fp16 cell fails, rms is informational only
 #define CRIT_GRAPH 1e-3f
@@ -355,7 +355,8 @@ static int test_record(const char *name, int K, int IC, int OC, int NT, int NR,
 }
 
 int main(int argc, char **argv) {
-    const char *path = (argc > 1) ? argv[1] : FIXTURE_DEFAULT;
+    const char *env = getenv("ESCHA_FIXTURE");
+    const char *path = (argc > 1) ? argv[1] : (env && env[0]) ? env : FIXTURE_DEFAULT;
     size_t n;
     void *buf = read_all(path, &n);
     if (!buf) return 1;

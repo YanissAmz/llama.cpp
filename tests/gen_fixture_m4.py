@@ -9,6 +9,7 @@ For one K=2 and one K=3 projection (real escha_code / rin / rout / bias):
         xs = x*(s_in*rin) ; xp = T128(xs) ; z = xp @ Wh ; y = T128(z)*(s_out*rout)
     plus the deploy bias added at the end.
 """
+import os
 import json
 import struct
 import sys
@@ -17,11 +18,11 @@ import numpy as np
 import torch
 from safetensors import safe_open
 
-sys.path.insert(0, "/home/yaniss/hermes-work/escha/port")
+sys.path.insert(0, os.environ.get("ESCHA_PORT", os.path.dirname(os.path.abspath(__file__))))
 from escham_cpu import reconstruct_code  # noqa: E402
 
-CKPT = "/home/yaniss/models/qwen3.8-27b-escha-w2"
-OUT = "/home/yaniss/hermes-work/escha/port/fixture_m4.bin"
+CKPT = os.environ.get("ESCHA_CKPT", "./escha-w2")
+OUT = os.environ.get("ESCHA_FIXTURE", "./fixture_m4.bin")
 NT = 8   # unit tiles per record
 NR = 4   # graph samples per record
 

@@ -8,6 +8,7 @@ that loads and runs, and answers nonsense.
 Escha-coded weights are folded back to dense (reconstruct_deploy_weight) before
 comparing, so the escha payload and its rin/rout are checked too.
 """
+import os
 import sys
 import numpy as np
 
@@ -15,8 +16,8 @@ sys.path.insert(0, ".")
 from gguf_escha import parse_gguf, read_raw_i16   # noqa: E402
 import escham_cpu                                  # noqa: E402
 
-NAT = "/home/yaniss/models/qwen3.8-27b-escha-gguf/escha-native.gguf"
-ORA = "/home/yaniss/models/qwen3.8-27b-escha-gguf/escha-oracle-q8_0.gguf"
+NAT = os.environ.get("ESCHA_GGUF", "./escha-native.gguf")
+ORA = os.environ.get("ESCHA_ORACLE", "./escha-oracle-q8_0.gguf")
 
 # Q8_0 round-trip noise. Anything above this is a real difference.
 TOL = 0.02
