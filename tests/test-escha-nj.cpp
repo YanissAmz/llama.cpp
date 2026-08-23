@@ -82,14 +82,14 @@ int main(){
                 float r = rel_rms(y.data()+(size_t)j*OC, y1.data(), OC);
                 if(r>worst) worst=r;
             }
-            // M8 : a partir de 16 colonnes le prefill passe sur les tensor cores
+            // M8 : a partir de 8 colonnes le prefill passe sur les tensor cores
             // en f16. L'ecart attendu est celui de l'arrondi f16, ~2e-04, et il
             // est plat en nc. Une erreur de disposition de fragment donnerait un
             // ecart d'ordre 1, pas 2e-04 : le seuil separe bien les deux cas.
 #if defined(GGML_USE_HIP)
             const float tol = 1e-5f;                 // HIP reste sur le chemin V5
 #else
-            const float tol = (nc >= 16) ? 1e-3f : 1e-5f;
+            const float tol = (nc >= 8) ? 1e-3f : 1e-5f;
 #endif
             const bool ok = worst < tol;
             if(!ok) ++fails;

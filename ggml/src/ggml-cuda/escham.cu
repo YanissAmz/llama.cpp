@@ -830,7 +830,16 @@ void ggml_cuda_escham_mul_mat_raw(const void * src0_data, const void * src1_data
         // en nbands/BB et une troncature perdrait des bandes en silence.
         // En dessous de 16 colonnes le fragment wmma (N=16) est plus qu'a
         // moitie vide et V5 reste meilleur.
-        if (escham_cuda_has_mma() && nc >= 16 && (oc/16) % 4 == 0) {
+        // deux conditions distinctes : assez de bandes pour que grid.x ne soit pas
+        // nul, et divisibilite pour qu'il ne tronque pas.
+        // Seuil mesure, pas suppose (23/08, 3090, pp512, mma vs V5 a une variable) :
+        //   nc=2  0,83x   nc=4  0,84x   nc=6  0,98x
+        //   nc=8  1,11x   nc=10 1,32x   nc=12 1,44x   nc=14 1,57x
+        // La bascule est a 7. En dessous, le bourrage jusqu'a NJ=32 coute plus
+        // que les tensor cores ne rapportent. GGML_ESCHA_MMA_MIN redeplace le
+        // seuil pour remesurer sans recompiler.
+        static const int mma_min = [](){ const char*e=getenv("GGML_ESCHA_MMA_MIN"); return e&&e[0]?atoi(e):8; }();
+        if (escham_cuda_has_mma() && nc >= mma_min && (oc/16) >= 4 && (oc/16) % 4 == 0) {
             if (is_k3) escham_launch_prefill_mma<true , 32, 2, 4>(codes,x,y,ic,oc,nc,st);
             else       escham_launch_prefill_mma<false, 32, 2, 4>(codes,x,y,ic,oc,nc,st);
             CUDA_CHECK(cudaGetLastError());
