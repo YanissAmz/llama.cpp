@@ -612,21 +612,50 @@ void ggml_cuda_escham_mul_mat_raw(const void * src0_data, const void * src1_data
     if(nc == 1){
         if(is_k3) escham_launch_fast<true , 1>(codes,x,y,ic,oc,nc,st);
         else      escham_launch_fast<false, 1>(codes,x,y,ic,oc,nc,st);
-    } else if(nc <= 4){
-        if(is_k3) escham_launch_prefill<true ,  4, 4>(codes,x,y,ic,oc,nc,st);
-        else      escham_launch_prefill<false,  4, 4>(codes,x,y,ic,oc,nc,st);
-    } else if(nc <= 8){
-        if(is_k3) escham_launch_prefill<true ,  8, 4>(codes,x,y,ic,oc,nc,st);
-        else      escham_launch_prefill<false,  8, 4>(codes,x,y,ic,oc,nc,st);
-    } else if(nc <= 16){
-        if(is_k3) escham_launch_prefill<true , 16, 4>(codes,x,y,ic,oc,nc,st);
-        else      escham_launch_prefill<false, 16, 4>(codes,x,y,ic,oc,nc,st);
     } else {
         // M7 : prefill batche — etage x en memoire partagee.
-        // RETENU (V5) : NJ=32, UNR=2, NWARPS=4 (128 threads, 16 Kio shared),
-        // decodage x16 a nc=512 au lieu de x128. Le chemin nc==1 est intact.
-        if(is_k3) escham_launch_prefill<true , 32, 4>(codes,x,y,ic,oc,nc,st);
-        else      escham_launch_prefill<false, 32, 4>(codes,x,y,ic,oc,nc,st);
+        // Le bloc decode NJ colonnes qu'elles soient vivantes ou non : le cout
+        // suit njb*NJ, pas nc. Un NJ fixe gaspille donc tout ce qui depasse.
+        // On choisit NJ par un score eff(NJ) * nc / (njb*NJ), ou eff est le debit
+        // mesure a remplissage plein (NJ=4 -> 99, 8 -> 144, 16 -> 169, 32 -> 201
+        // t/s sur 3090) interpole lineairement pour les valeurs intermediaires.
+        static const int   NJC[] = {   4,   6,   8,  10,  12,  14,  16,  20,  24,  28,  32 };
+        static const float EFF[] = { 99.f,122.f,144.f,150.f,156.f,163.f,169.f,177.f,185.f,193.f,201.f };
+        const int NCAND = (int)(sizeof(NJC)/sizeof(NJC[0]));
+        int   bestNJ = 32;
+        float bestSc = -1.f;
+        for (int i = 0; i < NCAND; ++i) {
+            const int nj    = NJC[i];
+            const int slots = (int)((nc + nj - 1)/nj)*nj;
+            const float sc  = EFF[i] * (float)nc / (float)slots;
+            if (sc > bestSc) { bestSc = sc; bestNJ = nj; }
+        }
+        switch (bestNJ) {
+            case  4: if(is_k3) escham_launch_prefill<true ,  4, 4>(codes,x,y,ic,oc,nc,st);
+                     else      escham_launch_prefill<false,  4, 4>(codes,x,y,ic,oc,nc,st); break;
+            case  6: if(is_k3) escham_launch_prefill<true ,  6, 4>(codes,x,y,ic,oc,nc,st);
+                     else      escham_launch_prefill<false,  6, 4>(codes,x,y,ic,oc,nc,st); break;
+            case  8: if(is_k3) escham_launch_prefill<true ,  8, 4>(codes,x,y,ic,oc,nc,st);
+                     else      escham_launch_prefill<false,  8, 4>(codes,x,y,ic,oc,nc,st); break;
+            case 10: if(is_k3) escham_launch_prefill<true , 10, 4>(codes,x,y,ic,oc,nc,st);
+                     else      escham_launch_prefill<false, 10, 4>(codes,x,y,ic,oc,nc,st); break;
+            case 12: if(is_k3) escham_launch_prefill<true , 12, 4>(codes,x,y,ic,oc,nc,st);
+                     else      escham_launch_prefill<false, 12, 4>(codes,x,y,ic,oc,nc,st); break;
+            case 14: if(is_k3) escham_launch_prefill<true , 14, 4>(codes,x,y,ic,oc,nc,st);
+                     else      escham_launch_prefill<false, 14, 4>(codes,x,y,ic,oc,nc,st); break;
+            case 16: if(is_k3) escham_launch_prefill<true , 16, 4>(codes,x,y,ic,oc,nc,st);
+                     else      escham_launch_prefill<false, 16, 4>(codes,x,y,ic,oc,nc,st); break;
+            case 20: if(is_k3) escham_launch_prefill<true , 20, 4>(codes,x,y,ic,oc,nc,st);
+                     else      escham_launch_prefill<false, 20, 4>(codes,x,y,ic,oc,nc,st); break;
+            case 24: if(is_k3) escham_launch_prefill<true , 24, 4>(codes,x,y,ic,oc,nc,st);
+                     else      escham_launch_prefill<false, 24, 4>(codes,x,y,ic,oc,nc,st); break;
+            case 28: if(is_k3) escham_launch_prefill<true , 28, 4>(codes,x,y,ic,oc,nc,st);
+                     else      escham_launch_prefill<false, 28, 4>(codes,x,y,ic,oc,nc,st); break;
+            case 32: if(is_k3) escham_launch_prefill<true , 32, 4>(codes,x,y,ic,oc,nc,st);
+                     else      escham_launch_prefill<false, 32, 4>(codes,x,y,ic,oc,nc,st); break;
+            default: if(is_k3) escham_launch_prefill<true , 32, 4>(codes,x,y,ic,oc,nc,st);
+                     else      escham_launch_prefill<false, 32, 4>(codes,x,y,ic,oc,nc,st); break;
+        }
     }
     (void)grid; (void)block; (void)nbands;
     CUDA_CHECK(cudaGetLastError());

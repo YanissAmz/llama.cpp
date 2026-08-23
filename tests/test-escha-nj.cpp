@@ -1,0 +1,67 @@
+// Verifie le dispatch NJ du noyau prefill : pour chaque nc de 2 a 40, la
+// colonne j du resultat batche doit egaler le resultat du chemin nc==1 sur
+// cette meme colonne. Les codes sont aleatoires : seul compte que les deux
+// noyaux voient les memes poids.
+#include "../ggml/src/ggml-cuda/escham.cuh"
+#if defined(GGML_USE_HIP)
+#include <hip/hip_runtime.h>
+#define cudaMalloc            hipMalloc
+#define cudaFree              hipFree
+#define cudaMemcpy            hipMemcpy
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#else
+#include <cuda_runtime.h>
+#endif
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <vector>
+
+static float rel_rms(const float *a, const float *b, size_t n){
+    double num=0, den=0;
+    for(size_t i=0;i<n;++i){ double d=(double)a[i]-b[i]; num+=d*d; den+=(double)b[i]*b[i]; }
+    return den>0 ? (float)sqrt(num/den) : (float)sqrt(num);
+}
+
+int main(){
+    const int IC=1024, OC=512;
+    int fails=0;
+    for(int is_k3=0; is_k3<2; ++is_k3){
+        const int K = is_k3 ? 3 : 2;
+        const size_t ncode = (size_t)(IC/16)*(OC/16)*16*K;
+        std::vector<uint16_t> h_codes(ncode);
+        for(size_t i=0;i<ncode;++i) h_codes[i]=(uint16_t)(rand()&0xFFFF);
+        uint16_t *d_codes; cudaMalloc(&d_codes, ncode*sizeof(uint16_t));
+        cudaMemcpy(d_codes, h_codes.data(), ncode*sizeof(uint16_t), cudaMemcpyHostToDevice);
+
+        const int NCMAX=40;
+        std::vector<float> h_x((size_t)IC*NCMAX);
+        for(size_t i=0;i<h_x.size();++i) h_x[i]=(float)((rand()/(double)RAND_MAX)*2.0-1.0);
+        float *d_x, *d_y, *d_y1;
+        cudaMalloc(&d_x, h_x.size()*sizeof(float));
+        cudaMalloc(&d_y, (size_t)OC*NCMAX*sizeof(float));
+        cudaMalloc(&d_y1, (size_t)OC*sizeof(float));
+        cudaMemcpy(d_x, h_x.data(), h_x.size()*sizeof(float), cudaMemcpyHostToDevice);
+
+        for(int nc=2; nc<=NCMAX; ++nc){
+            ggml_cuda_escham_mul_mat_raw(d_codes, d_x, d_y, IC, OC, nc, is_k3, nullptr);
+            std::vector<float> y((size_t)OC*nc);
+            cudaMemcpy(y.data(), d_y, y.size()*sizeof(float), cudaMemcpyDeviceToHost);
+            float worst=0;
+            for(int j=0;j<nc;++j){
+                ggml_cuda_escham_mul_mat_raw(d_codes, d_x+(size_t)j*IC, d_y1, IC, OC, 1, is_k3, nullptr);
+                std::vector<float> y1(OC);
+                cudaMemcpy(y1.data(), d_y1, OC*sizeof(float), cudaMemcpyDeviceToHost);
+                float r = rel_rms(y.data()+(size_t)j*OC, y1.data(), OC);
+                if(r>worst) worst=r;
+            }
+            const bool ok = worst < 1e-5f;
+            if(!ok) ++fails;
+            printf("K=%d nc=%2d  worst_col_vs_nc1 %.3e  %s\n", K, nc, worst, ok?"OK":"FAIL");
+        }
+        cudaFree(d_codes); cudaFree(d_x); cudaFree(d_y); cudaFree(d_y1);
+    }
+    printf("\nverdict: %s (%d fails)\n", fails?"FAIL":"PASS", fails);
+    return fails?1:0;
+}
