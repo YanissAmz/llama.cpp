@@ -6,6 +6,7 @@
 #include "ggml.h"
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 
 #define ESCHAM_MASK  0x8FFF8FFFu
 #define ESCHAM_MAGIC 0x3B603B60u
@@ -745,9 +746,15 @@ static void escham_launch_prefill_mma(const uint16_t * codes, const float * x, f
 }
 
 // Le chemin tensor demande sm_70. En dessous, et sous HIP, on garde V5.
+//
+// GGML_ESCHA_NO_MMA=1 le desactive a l'execution. Deux raisons de le garder :
+// mesurer les deux chemins avec UN SEUL binaire, donc a une seule variable ; et
+// laisser une sortie de secours si le f16 gene un modele particulier.
 static bool escham_cuda_has_mma(){
     static int cached = -1;
     if (cached < 0) {
+        const char * off = getenv("GGML_ESCHA_NO_MMA");
+        if (off && off[0] && off[0] != '0') { cached = 0; return false; }
         int dev = 0, major = 0;
         if (cudaGetDevice(&dev) != cudaSuccess) { cached = 0; return false; }
         if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) { cached = 0; return false; }
