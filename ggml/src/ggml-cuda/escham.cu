@@ -612,6 +612,15 @@ void ggml_cuda_escham_mul_mat_raw(const void * src0_data, const void * src1_data
     if(nc == 1){
         if(is_k3) escham_launch_fast<true , 1>(codes,x,y,ic,oc,nc,st);
         else      escham_launch_fast<false, 1>(codes,x,y,ic,oc,nc,st);
+    } else if(nc <= 4){
+        if(is_k3) escham_launch_prefill<true ,  4, 4>(codes,x,y,ic,oc,nc,st);
+        else      escham_launch_prefill<false,  4, 4>(codes,x,y,ic,oc,nc,st);
+    } else if(nc <= 8){
+        if(is_k3) escham_launch_prefill<true ,  8, 4>(codes,x,y,ic,oc,nc,st);
+        else      escham_launch_prefill<false,  8, 4>(codes,x,y,ic,oc,nc,st);
+    } else if(nc <= 16){
+        if(is_k3) escham_launch_prefill<true , 16, 4>(codes,x,y,ic,oc,nc,st);
+        else      escham_launch_prefill<false, 16, 4>(codes,x,y,ic,oc,nc,st);
     } else {
         // M7 : prefill batche — etage x en memoire partagee.
         // RETENU (V5) : NJ=32, UNR=2, NWARPS=4 (128 threads, 16 Kio shared),
