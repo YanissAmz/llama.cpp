@@ -386,6 +386,161 @@ escham_kernel_fast(const uint16_t * __restrict__ codes,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Noyau prefill M7 : identique a escham_kernel_fast mais l'etage x vit en
+// memoire partagee au lieu des registres. Chaque lane gardait xv[UNR][NJ] +
+// xv8[UNR][NJ] = NJ*8*UNR flottants ; a NJ=16 et UNR=2 cela fait 256 registres
+// de trop. La tuile x (UNR * NJ * 16 valeurs) est chargee cooperativement une
+// fois par iteration et relue par toutes les lanes : les memes valeurs de x
+// servent toutes les bandes. Seuls accA[NJ]/accB[NJ] restent en registres.
+// ---------------------------------------------------------------------------
+
+template<bool K3, int NJ, int NWARPS>
+__global__ void __launch_bounds__(NWARPS*32)
+escham_kernel_prefill(const uint16_t * __restrict__ codes,
+                      const float * __restrict__ x,
+                      float * __restrict__ y,
+                      int ic, int oc, int nc,
+                      const float * __restrict__ lut,
+                      int tiles_per_chunk){
+    const int NW       = K3 ? 24 : 16;
+    const int ntiles   = ic / 16;
+
+    const int band = blockIdx.x;
+    const int j0   = blockIdx.y * NJ;
+    const int t_begin = (int)blockIdx.z * tiles_per_chunk;
+    const int t_end   = min(ntiles, t_begin + tiles_per_chunk);
+
+    const int warp   = threadIdx.x >> 5;
+    const int lane   = threadIdx.x & 31;
+    const int nwarps = blockDim.x >> 5;
+
+    const int m  = lane;
+    const int r0 = 2*(m & 3);
+    const int c0 = 2*((m>>3)&1) + 4*((m>>4)&1);
+    const int d  = (m>>2)&1;
+    const int cA = c0 + d;
+    const int cB = c0 + 8 + d;
+
+    int cur, prv, sh;
+    if (K3) {
+        const int b = m*24, r86 = b + 791, r87 = r86 & 2016;
+        cur = (((r86>>3)&252)-96)/4;
+        prv = (m==0) ? 23 : (((b+755)>>5)-24);
+        sh  = r87 - b - 760;
+    } else {
+        cur = (m>>1)&15;
+        prv = (cur-1)&15;
+        sh  = (m&1)==0 ? 16 : 0;
+    }
+
+    const uint32_t * band32 = reinterpret_cast<const uint32_t *>(codes)
+                            + (int64_t)band * ntiles * NW;
+
+    float accA[NJ], accB[NJ];
+#pragma unroll
+    for (int u = 0; u < NJ; ++u) { accA[u] = 0.f; accB[u] = 0.f; }
+
+    const int UNR = 2;
+    // tuile x partagee, UNE TRANCHE PAR WARP : chaque warp itere sur un t
+    // different, ils ne doivent pas se marcher dessus. La taille derive de
+    // NWARPS (parametre de template) : le partage et le bloc ne peuvent plus
+    // diverger. V5 : NJ=32, UNR=2, NWARPS=4 -> 4*2*32*16*4 o = 16 Kio.
+    __shared__ float s_xt[NWARPS*UNR*NJ*16];
+    float * xt_w = &s_xt[warp*UNR*NJ*16];
+
+    for (int t = t_begin + warp; t < t_end; t += UNR*nwarps) {
+        uint32_t wrd[UNR];
+#pragma unroll
+        for (int q = 0; q < UNR; ++q) {
+            const int tq = t + q*nwarps;
+            const bool live = tq < t_end;
+            wrd[q] = 0;
+            if (live && lane < NW) {
+                wrd[q] = band32[tq*NW + lane];
+            }
+        }
+        // chargement cooperatif de la tuile x, intra-warp, VECTORISE float4.
+        // tq*16 est aligne 64 o et j*ic l'est aussi (ic%16==0), donc float4 ok.
+        {
+#pragma unroll
+            for (int q = 0; q < UNR; ++q) {
+                const int tq = t + q*nwarps;
+                const bool live = tq < t_end;
+                // NJ*16 flottants = NJ*4 float4 ; NJ=32 -> 128 float4 sur 32 lanes
+                for (int li = lane; li < NJ*4; li += WARP_SIZE) {
+                    const int u  = li >> 2;
+                    const int r  = (li & 3) * 4;
+                    const int j  = j0 + u;
+                    float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                    if (live && j < nc) {
+                        v = *reinterpret_cast<const float4 *>(x + (int64_t)j*ic + tq*16 + r);
+                    }
+                    *reinterpret_cast<float4 *>(&xt_w[q*NJ*16 + li*4]) = v;
+                }
+            }
+        }
+        __syncwarp();
+
+#pragma unroll
+        for (int q = 0; q < UNR; ++q) {
+            const uint64_t pair = ((uint64_t)__shfl_sync(0xffffffffu, wrd[q], prv, WARP_SIZE) << 32)
+                                |  (uint64_t)__shfl_sync(0xffffffffu, wrd[q], cur, WARP_SIZE);
+            const uint32_t v0 = (uint32_t)(pair >> sh);
+            const uint32_t v1 = K3 ? (uint32_t)(pair >> (sh + 18)) : 0u;
+            float wv[8];
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                uint32_t src; int off;
+                if (K3) { const bool hi = s >= 6; src = hi ? v1 : v0; off = 3*s - (hi ? 18 : 0); }
+                else    { src = v0; off = 2*s; }
+                wv[s] = escham_decode((uint16_t)((src >> off) & 0xffffu));
+            }
+            const float * xu = &xt_w[q*NJ*16];
+#pragma unroll
+            for (int u = 0; u < NJ; ++u) {
+                const float xr[4] = { xu[u*16 + r0 + 9], xu[u*16 + r0 + 8],
+                                      xu[u*16 + r0 + 1], xu[u*16 + r0 + 0] };
+#pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    accB[u] += wv[s]   * xr[s];
+                    accA[u] += wv[s+4] * xr[s];
+                }
+            }
+        }
+        __syncwarp();
+    }
+
+#pragma unroll
+    for (int u = 0; u < NJ; ++u) {
+        accA[u] += __shfl_xor_sync(0xffffffffu, accA[u], 2, 4);
+        accB[u] += __shfl_xor_sync(0xffffffffu, accB[u], 2, 4);
+        accA[u] += __shfl_xor_sync(0xffffffffu, accA[u], 1, 4);
+        accB[u] += __shfl_xor_sync(0xffffffffu, accB[u], 1, 4);
+    }
+
+    __shared__ float s_acc[NJ][16];
+    for (int i = threadIdx.x; i < NJ*16; i += blockDim.x) {
+        s_acc[i>>4][i&15] = 0.f;
+    }
+    __syncthreads();
+    if ((lane & 3) == 0) {
+#pragma unroll
+        for (int u = 0; u < NJ; ++u) {
+            atomicAdd(&s_acc[u][cA], accA[u]);
+            atomicAdd(&s_acc[u][cB], accB[u]);
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < NJ*16; i += blockDim.x) {
+        const int u = i >> 4, c = i & 15;
+        const int j = j0 + u;
+        if (j < nc) {
+            atomicAdd(&y[(int64_t)j*oc + band*16 + c], s_acc[u][c]);
+        }
+    }
+}
+
 template<bool K3, int NJ>
 static void escham_launch_fast(const uint16_t * codes, const float * x, float * y,
                                int64_t ic, int64_t oc, int64_t nc, cudaStream_t st){
@@ -402,6 +557,23 @@ static void escham_launch_fast(const uint16_t * codes, const float * x, float * 
     dim3 grid((unsigned)nbands, (unsigned)njb, (unsigned)chunks);
     escham_kernel_fast<K3, NJ><<<grid, 256, 0, st>>>(codes, x, y, (int)ic, (int)oc, (int)nc,
                                                      d_lut, tiles_per_chunk);
+}
+
+// M7 : launcher du noyau prefill. Meme decoupage de ic que escham_launch_fast.
+template<bool K3, int NJ, int NWARPS>
+static void escham_launch_prefill(const uint16_t * codes, const float * x, float * y,
+                                  int64_t ic, int64_t oc, int64_t nc, cudaStream_t st){
+    const int ntiles = (int)(ic/16);
+    const int nbands = (int)(oc/16);
+    const int njb    = (int)((nc + NJ - 1)/NJ);
+    int chunks = 2048 / (nbands*njb);
+    if (chunks < 1) chunks = 1;
+    if (chunks > ntiles/8 + 1) chunks = ntiles/8 + 1;
+    const int tiles_per_chunk = (ntiles + chunks - 1)/chunks;
+    chunks = (ntiles + tiles_per_chunk - 1)/tiles_per_chunk;
+    dim3 grid((unsigned)nbands, (unsigned)njb, (unsigned)chunks);
+    escham_kernel_prefill<K3, NJ, NWARPS><<<grid, NWARPS*32, 0, st>>>(codes, x, y, (int)ic, (int)oc, (int)nc,
+                                                      d_lut, tiles_per_chunk);
 }
 
 static __global__ void escham_zero_kernel(float * y, int64_t n){
@@ -441,8 +613,11 @@ void ggml_cuda_escham_mul_mat_raw(const void * src0_data, const void * src1_data
         if(is_k3) escham_launch_fast<true , 1>(codes,x,y,ic,oc,nc,st);
         else      escham_launch_fast<false, 1>(codes,x,y,ic,oc,nc,st);
     } else {
-        if(is_k3) escham_launch_fast<true , 4>(codes,x,y,ic,oc,nc,st);
-        else      escham_launch_fast<false, 4>(codes,x,y,ic,oc,nc,st);
+        // M7 : prefill batche — etage x en memoire partagee.
+        // RETENU (V5) : NJ=32, UNR=2, NWARPS=4 (128 threads, 16 Kio shared),
+        // decodage x16 a nc=512 au lieu de x128. Le chemin nc==1 est intact.
+        if(is_k3) escham_launch_prefill<true , 32, 4>(codes,x,y,ic,oc,nc,st);
+        else      escham_launch_prefill<false, 32, 4>(codes,x,y,ic,oc,nc,st);
     }
     (void)grid; (void)block; (void)nbands;
     CUDA_CHECK(cudaGetLastError());
