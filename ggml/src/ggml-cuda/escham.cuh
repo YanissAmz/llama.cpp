@@ -11,6 +11,10 @@ struct ggml_tensor;
 void ggml_cuda_escham_mul_mat_raw(const void * src0_data, const void * src1_data, void * dst_data,
                                   int64_t ic, int64_t oc, int64_t nc, int is_k3, void * stream);
 
+// M7 : NJ choisi pour le noyau prefill a un nombre de colonnes donne.
+// Expose pour que le test puisse verifier le choix, pas seulement le resultat.
+int ggml_cuda_escham_prefill_nj(int64_t nc);
+
 // ggml tensor dispatch
 void ggml_cuda_escham_mul_mat(struct ggml_backend_cuda_context & ctx,
                               const struct ggml_tensor * src0,

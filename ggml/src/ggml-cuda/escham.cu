@@ -583,6 +583,30 @@ static __global__ void escham_zero_kernel(float * y, int64_t n){
     }
 }
 
+// M7 : le bloc prefill decode NJ colonnes qu'elles soient vivantes ou non. Le
+// cout suit donc njb*NJ et non nc, et un NJ fixe gaspille tout ce qui depasse.
+// On maximise eff(NJ) * nc / (njb*NJ), ou eff est le debit a bloc plein mesure
+// sur 3090 (NJ = 4 -> 99, 8 -> 144, 16 -> 169, 32 -> 201 t/s) et interpole
+// lineairement entre ces points.
+//
+// ATTENTION : eff est un ajustement CUDA/3090. Sur gfx1151 la courbe a une
+// autre forme (LDS, wave64, banc de registres) et le classement peut differer.
+// Le choix y reste correct — test-escha-nj passe — mais pas forcement optimal.
+int ggml_cuda_escham_prefill_nj(int64_t nc){
+    static const int   NJC[] = {   4,   6,   8,  10,  12,  14,  16,  20,  24,  28,  32 };
+    static const float EFF[] = { 99.f,122.f,144.f,150.f,156.f,163.f,169.f,177.f,185.f,193.f,201.f };
+    const int NCAND = (int)(sizeof(NJC)/sizeof(NJC[0]));
+    int   bestNJ = 32;
+    float bestSc = -1.f;
+    for (int i = 0; i < NCAND; ++i) {
+        const int nj    = NJC[i];
+        const int slots = (int)((nc + nj - 1)/nj)*nj;
+        const float sc  = EFF[i] * (float)nc / (float)slots;
+        if (sc > bestSc) { bestSc = sc; bestNJ = nj; }
+    }
+    return bestNJ;
+}
+
 void ggml_cuda_escham_mul_mat_raw(const void * src0_data, const void * src1_data, void * dst_data,
                                   int64_t ic, int64_t oc, int64_t nc, int is_k3, void * stream){
     escham_cuda_init_tables();
@@ -613,23 +637,7 @@ void ggml_cuda_escham_mul_mat_raw(const void * src0_data, const void * src1_data
         if(is_k3) escham_launch_fast<true , 1>(codes,x,y,ic,oc,nc,st);
         else      escham_launch_fast<false, 1>(codes,x,y,ic,oc,nc,st);
     } else {
-        // M7 : prefill batche — etage x en memoire partagee.
-        // Le bloc decode NJ colonnes qu'elles soient vivantes ou non : le cout
-        // suit njb*NJ, pas nc. Un NJ fixe gaspille donc tout ce qui depasse.
-        // On choisit NJ par un score eff(NJ) * nc / (njb*NJ), ou eff est le debit
-        // mesure a remplissage plein (NJ=4 -> 99, 8 -> 144, 16 -> 169, 32 -> 201
-        // t/s sur 3090) interpole lineairement pour les valeurs intermediaires.
-        static const int   NJC[] = {   4,   6,   8,  10,  12,  14,  16,  20,  24,  28,  32 };
-        static const float EFF[] = { 99.f,122.f,144.f,150.f,156.f,163.f,169.f,177.f,185.f,193.f,201.f };
-        const int NCAND = (int)(sizeof(NJC)/sizeof(NJC[0]));
-        int   bestNJ = 32;
-        float bestSc = -1.f;
-        for (int i = 0; i < NCAND; ++i) {
-            const int nj    = NJC[i];
-            const int slots = (int)((nc + nj - 1)/nj)*nj;
-            const float sc  = EFF[i] * (float)nc / (float)slots;
-            if (sc > bestSc) { bestSc = sc; bestNJ = nj; }
-        }
+        const int bestNJ = ggml_cuda_escham_prefill_nj(nc);
         switch (bestNJ) {
             case  4: if(is_k3) escham_launch_prefill<true ,  4, 4>(codes,x,y,ic,oc,nc,st);
                      else      escham_launch_prefill<false,  4, 4>(codes,x,y,ic,oc,nc,st); break;

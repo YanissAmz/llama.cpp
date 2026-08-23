@@ -24,9 +24,35 @@ static float rel_rms(const float *a, const float *b, size_t n){
     return den>0 ? (float)sqrt(num/den) : (float)sqrt(num);
 }
 
+// Reference independante du selecteur : argmax a la main sur les memes
+// candidats, pour prouver que le dispatch choisit bien ce qu'on croit.
+static int expected_nj(int nc){
+    static const int   NJC[] = {   4,   6,   8,  10,  12,  14,  16,  20,  24,  28,  32 };
+    static const double EFF[] = { 99, 122, 144, 150, 156, 163, 169, 177, 185, 193, 201 };
+    int best=32; double bs=-1;
+    for(int i=0;i<11;++i){
+        int slots = ((nc + NJC[i] - 1)/NJC[i])*NJC[i];
+        double sc = EFF[i]*(double)nc/(double)slots;
+        if(sc>bs){ bs=sc; best=NJC[i]; }
+    }
+    return best;
+}
+
 int main(){
     const int IC=1024, OC=512;
     int fails=0;
+
+    // 1. le selecteur choisit-il l'argmax attendu ?
+    for(int nc=2; nc<=512; ++nc){
+        const int got = ggml_cuda_escham_prefill_nj(nc);
+        const int exp = expected_nj(nc);
+        if(got != exp){ printf("SELECT nc=%d got NJ=%d expected %d  FAIL\n", nc, got, exp); ++fails; }
+    }
+    printf("select: nc 2..512 %s\n", fails?"FAIL":"OK");
+    // quelques points nommes, pour que le choix soit lisible dans la sortie
+    for(int nc : {2,4,5,8,9,16,17,24,32,33,512})
+        printf("  nc=%3d -> NJ=%d\n", nc, ggml_cuda_escham_prefill_nj(nc));
+
     for(int is_k3=0; is_k3<2; ++is_k3){
         const int K = is_k3 ? 3 : 2;
         const size_t ncode = (size_t)(IC/16)*(OC/16)*16*K;
