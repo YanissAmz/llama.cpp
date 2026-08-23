@@ -576,6 +576,187 @@ static void escham_launch_prefill(const uint16_t * codes, const float * x, float
                                                       d_lut, tiles_per_chunk);
 }
 
+// ---------------------------------------------------------------------------
+// M8 : noyau prefill sur tensor cores.
+//
+// Le noyau V5 plafonnait a ~11 TFLOP/s, un tiers du pic fp32. Le pipe de
+// multiplication n'etait pas la limite : chaque bande relisait `x` en entier,
+// soit 3,3 Go de trafic L2 par appel sur une matrice 5120x5120x512.
+//
+// Le remede est de charger la tuile `x` une fois et de la relire pour BB
+// bandes. V5 en est incapable : ses accumulateurs `accA[BB][NJ]+accB[BB][NJ]`
+// debordent des BB=2, et il devient 2,5x plus lent a BB=4. L'accumulateur wmma
+// tient 16 sorties x 16 colonnes dans 8 flottants par voie — quatre fois moins,
+// parce qu'il n'a pas la redondance d'un facteur 4 que V5 paie avec sa
+// reduction par shfl sur quatre voies.
+//
+// Les tensor cores ne gagnent donc pas sur le calcul. Ils gagnent en liberant
+// les registres qui rendent le blocage par bandes possible. Les deux effets ne
+// se separent pas.
+//
+// f16 plutot que tf32 : meme mantisse de 10 bits, pic tensor double. Et ici la
+// dynamique perdue ne coute rien, parce que les poids escha SONT deja des fp16
+// — escham_decode additionne les deux moities fp16 d'un mot. Mesure a l'appui,
+// l'ecart contre V5 est le meme dans les deux precisions : 1,9e-04.
+//
+// 11 000 -> 40 000 GFLOP/s. 3,6x a 4,7x sur le produit isole.
+#if !defined(GGML_USE_HIP)
+#include <mma.h>
+
+template<bool K3, int NJ, int NWARPS, int BB>
+__global__ void __launch_bounds__(NWARPS*32)
+escham_kernel_prefill_mma(const uint16_t * __restrict__ codes,
+                          const float * __restrict__ x,
+                          float * __restrict__ y,
+                          int ic, int oc, int nc,
+                          int tiles_per_chunk){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;
+    static_assert(NJ % 16 == 0, "NJ doit etre un multiple de 16 : c'est le N du fragment wmma");
+    const int NW     = K3 ? 24 : 16;
+    const int NG     = NJ/16;
+    const int ntiles = ic/16;
+
+    const int band0   = blockIdx.x * BB;
+    const int j0      = blockIdx.y * NJ;
+    const int t_begin = (int)blockIdx.z * tiles_per_chunk;
+    const int t_end   = min(ntiles, t_begin + tiles_per_chunk);
+
+    const int warp   = threadIdx.x >> 5;
+    const int lane   = threadIdx.x & 31;
+    const int nwarps = blockDim.x >> 5;
+
+    const int m  = lane;
+    const int r0 = 2*(m & 3);
+    const int c0 = 2*((m>>3)&1) + 4*((m>>4)&1);
+    const int d  = (m>>2)&1;
+    const int cA = c0 + d;
+    const int cB = c0 + 8 + d;
+
+    int cur, prv, sh;
+    if (K3) {
+        const int b = m*24, r86 = b + 791, r87 = r86 & 2016;
+        cur = (((r86>>3)&252)-96)/4;
+        prv = (m==0) ? 23 : (((b+755)>>5)-24);
+        sh  = r87 - b - 760;
+    } else {
+        cur = (m>>1)&15;
+        prv = (cur-1)&15;
+        sh  = (m&1)==0 ? 16 : 0;
+    }
+
+    // s_w : tuile de poids [entree][sortie] -> A en col_major, ld=16
+    // s_x : tuile de x     [colonne][entree] -> B en col_major, ld=16
+    __shared__ half  s_w[NWARPS*16*16];
+    __shared__ half  s_x[NWARPS*NJ*16];
+    __shared__ float s_o[NWARPS*16*16];
+    half  * w_w = &s_w[warp*16*16];
+    half  * x_w = &s_x[warp*NJ*16];
+    float * o_w = &s_o[warp*16*16];
+
+    wmma::fragment<wmma::accumulator, 16,16,16, float> acc[BB][NG];
+#pragma unroll
+    for (int bb = 0; bb < BB; ++bb)
+#pragma unroll
+        for (int g = 0; g < NG; ++g) wmma::fill_fragment(acc[bb][g], 0.f);
+
+    for (int t = t_begin + warp; t < t_end; t += nwarps) {
+        for (int li = lane; li < NJ*4; li += WARP_SIZE) {
+            const int u = li>>2, r = (li&3)*4, j = j0+u;
+            float4 v = make_float4(0.f,0.f,0.f,0.f);
+            if (j < nc) v = *reinterpret_cast<const float4*>(x + (int64_t)j*ic + t*16 + r);
+            x_w[li*4+0] = __float2half(v.x); x_w[li*4+1] = __float2half(v.y);
+            x_w[li*4+2] = __float2half(v.z); x_w[li*4+3] = __float2half(v.w);
+        }
+        __syncwarp();
+
+        wmma::fragment<wmma::matrix_b, 16,16,16, half, wmma::col_major> b[NJ/16];
+#pragma unroll
+        for (int g = 0; g < NG; ++g) wmma::load_matrix_sync(b[g], x_w + g*16*16, 16);
+
+#pragma unroll
+        for (int bb = 0; bb < BB; ++bb) {
+            const uint32_t * band32 = reinterpret_cast<const uint32_t *>(codes)
+                                    + (int64_t)(band0+bb) * ntiles * NW;
+            const uint32_t wrd = (lane < NW) ? band32[t*NW + lane] : 0u;
+
+            const uint64_t pair = ((uint64_t)__shfl_sync(0xffffffffu, wrd, prv, WARP_SIZE) << 32)
+                                |  (uint64_t)__shfl_sync(0xffffffffu, wrd, cur, WARP_SIZE);
+            const uint32_t v0 = (uint32_t)(pair >> sh);
+            const uint32_t v1 = K3 ? (uint32_t)(pair >> (sh + 18)) : 0u;
+            float wv[8];
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                uint32_t src; int off;
+                if (K3) { const bool hi = s >= 6; src = hi ? v1 : v0; off = 3*s - (hi ? 18 : 0); }
+                else    { src = v0; off = 2*s; }
+                wv[s] = escham_decode((uint16_t)((src >> off) & 0xffffu));
+            }
+            const int rr[4] = { r0+9, r0+8, r0+1, r0+0 };
+            __syncwarp();
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                w_w[rr[s]*16 + cB] = __float2half(wv[s]);
+                w_w[rr[s]*16 + cA] = __float2half(wv[s+4]);
+            }
+            __syncwarp();
+
+            wmma::fragment<wmma::matrix_a, 16,16,16, half, wmma::col_major> a;
+            wmma::load_matrix_sync(a, w_w, 16);
+#pragma unroll
+            for (int g = 0; g < NG; ++g) wmma::mma_sync(acc[bb][g], a, b[g], acc[bb][g]);
+        }
+        __syncwarp();
+    }
+
+#pragma unroll
+    for (int bb = 0; bb < BB; ++bb)
+#pragma unroll
+    for (int g = 0; g < NG; ++g) {
+        wmma::store_matrix_sync(o_w, acc[bb][g], 16, wmma::mem_col_major); // [colonne][sortie]
+        __syncwarp();
+        for (int li = lane; li < 16*16; li += WARP_SIZE) {
+            const int u = li>>4, o = li&15, j = j0 + g*16 + u;
+            if (j < nc) atomicAdd(&y[(int64_t)j*oc + (band0+bb)*16 + o], o_w[u*16 + o]);
+        }
+        __syncwarp();
+    }
+#else
+    GGML_UNUSED(codes); GGML_UNUSED(x); GGML_UNUSED(y);
+    GGML_UNUSED(ic); GGML_UNUSED(oc); GGML_UNUSED(nc); GGML_UNUSED(tiles_per_chunk);
+#endif
+}
+
+template<bool K3, int NJ, int NWARPS, int BB>
+static void escham_launch_prefill_mma(const uint16_t * codes, const float * x, float * y,
+                                      int64_t ic, int64_t oc, int64_t nc, cudaStream_t st){
+    const int ntiles = (int)(ic/16);
+    const int nbands = (int)(oc/16);
+    const int njb    = (int)((nc + NJ - 1)/NJ);
+    // le nombre de blocs vise est calcule sur nbands/BB : chaque bloc couvre BB bandes.
+    int chunks = 2048 / ((nbands/BB)*njb);
+    if (chunks < 1) chunks = 1;
+    if (chunks > ntiles/8 + 1) chunks = ntiles/8 + 1;
+    const int tiles_per_chunk = (ntiles + chunks - 1)/chunks;
+    chunks = (ntiles + tiles_per_chunk - 1)/tiles_per_chunk;
+    dim3 grid((unsigned)(nbands/BB), (unsigned)njb, (unsigned)chunks);
+    escham_kernel_prefill_mma<K3, NJ, NWARPS, BB><<<grid, NWARPS*32, 0, st>>>(
+        codes, x, y, (int)ic, (int)oc, (int)nc, tiles_per_chunk);
+}
+
+// Le chemin tensor demande sm_70. En dessous, et sous HIP, on garde V5.
+static bool escham_cuda_has_mma(){
+    static int cached = -1;
+    if (cached < 0) {
+        int dev = 0, major = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) { cached = 0; return false; }
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) { cached = 0; return false; }
+        cached = major >= 7 ? 1 : 0;
+    }
+    return cached == 1;
+}
+#endif // !GGML_USE_HIP
+
 static __global__ void escham_zero_kernel(float * y, int64_t n){
     for (int64_t i = (int64_t)blockIdx.x*blockDim.x + threadIdx.x; i < n;
          i += (int64_t)gridDim.x*blockDim.x) {
@@ -637,6 +818,18 @@ void ggml_cuda_escham_mul_mat_raw(const void * src0_data, const void * src1_data
         if(is_k3) escham_launch_fast<true , 1>(codes,x,y,ic,oc,nc,st);
         else      escham_launch_fast<false, 1>(codes,x,y,ic,oc,nc,st);
     } else {
+#if !defined(GGML_USE_HIP)
+        // M8 : chemin tensor. BB=4 exige nbands divisible par 4 — la grille est
+        // en nbands/BB et une troncature perdrait des bandes en silence.
+        // En dessous de 16 colonnes le fragment wmma (N=16) est plus qu'a
+        // moitie vide et V5 reste meilleur.
+        if (escham_cuda_has_mma() && nc >= 16 && (oc/16) % 4 == 0) {
+            if (is_k3) escham_launch_prefill_mma<true , 32, 2, 4>(codes,x,y,ic,oc,nc,st);
+            else       escham_launch_prefill_mma<false, 32, 2, 4>(codes,x,y,ic,oc,nc,st);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+#endif
         const int bestNJ = ggml_cuda_escham_prefill_nj(nc);
         switch (bestNJ) {
             case  4: if(is_k3) escham_launch_prefill<true ,  4, 4>(codes,x,y,ic,oc,nc,st);

@@ -82,9 +82,18 @@ int main(){
                 float r = rel_rms(y.data()+(size_t)j*OC, y1.data(), OC);
                 if(r>worst) worst=r;
             }
-            const bool ok = worst < 1e-5f;
+            // M8 : a partir de 16 colonnes le prefill passe sur les tensor cores
+            // en f16. L'ecart attendu est celui de l'arrondi f16, ~2e-04, et il
+            // est plat en nc. Une erreur de disposition de fragment donnerait un
+            // ecart d'ordre 1, pas 2e-04 : le seuil separe bien les deux cas.
+#if defined(GGML_USE_HIP)
+            const float tol = 1e-5f;                 // HIP reste sur le chemin V5
+#else
+            const float tol = (nc >= 16) ? 1e-3f : 1e-5f;
+#endif
+            const bool ok = worst < tol;
             if(!ok) ++fails;
-            printf("K=%d nc=%2d  worst_col_vs_nc1 %.3e  %s\n", K, nc, worst, ok?"OK":"FAIL");
+            printf("K=%d nc=%2d  worst_col_vs_nc1 %.3e  (tol %.0e)  %s\n", K, nc, worst, tol, ok?"OK":"FAIL");
         }
         cudaFree(d_codes); cudaFree(d_x); cudaFree(d_y); cudaFree(d_y1);
     }
