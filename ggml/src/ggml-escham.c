@@ -1,6 +1,6 @@
 // ESCHAM tile decode (CPU scalar) + vector transforms.
 //
-// Literal C port of ~/hermes-work/escha/port/escham_cpu.py (normative spec,
+// Literal C port of tools/escha/escham_cpu.py (normative spec,
 // hand-translated from the CUDA PTX, valid to 4.7e-4 rms against the vendor
 // wheel). Decodes one atomic 16x16 tile: 16*K int16 -> 256 fp16 weights,
 // 16-bit windows sliding K bits over the tile's circular code (tail-biting).
