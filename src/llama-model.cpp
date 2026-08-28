@@ -2419,6 +2419,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
 
+                // glm5next's trunk needs the hybrid wrapper (KDA layers + an indexer key
+                // cache), but its NextN block is a plain dense-MLA layer: no recurrent
+                // state, and build_dsa_layer takes its dense branch there. So the MTP
+                // context gets the same plain attention cache the Qwen3.5 MTP heads get,
+                // filtered to the nextn layer(s) below.
+                const bool mtp_on_hybrid_glm5next =
+                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_GLM5NEXT &&
+                    hparams.n_layer_nextn > 0;
+
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
                             *this,
@@ -2429,7 +2438,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_seq_max,
                             cparams.n_rs_seq,
                             nullptr);
-                } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
+                } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron &&
+                           !mtp_on_hybrid_glm5next) {
                     // The main difference between hybrid architectures is the
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
@@ -2541,7 +2551,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     }
 
-                    if (mtp_on_hybrid_qwen || mtp_on_hybrid_nemotron) {
+                    if (mtp_on_hybrid_qwen || mtp_on_hybrid_nemotron || mtp_on_hybrid_glm5next) {
                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                     }
 

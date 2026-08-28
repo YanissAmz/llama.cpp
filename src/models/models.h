@@ -1349,6 +1349,9 @@ struct llama_model_glm5next : public llama_model_base {
     // 24-row mixer split, activations, Sinkhorn); only the final collapse differs
     // (unweighted mean, not a learned gated head), so derive rather than restate
     struct graph : public llama_model_deepseek4::graph {
+        // params-only: builds nothing, so graph_mtp can inherit the DSA and FFN
+        // builders below without also running the trunk
+        graph(const llm_graph_params & params) : llama_model_deepseek4::graph(params) {}
         graph(const llama_model & model, const llm_graph_params & params);
 
         // not const: the delta-net helpers append to the graph through the base
@@ -1395,6 +1398,14 @@ struct llama_model_glm5next : public llama_model_base {
                 const llama_model & model,
                 ggml_tensor * cur,
                 int il) const;
+    };
+
+    // NextN/MTP draft head. blk.45 carries NO mHC tensors (blk.44 carries six), so the
+    // MTP block is a plain narrow decoder block: no hyper-connections, no stream
+    // expansion, no hc_mean - the residual is a straight add. eh_proj [2*n_embd, n_embd]
+    // says the same thing independently.
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

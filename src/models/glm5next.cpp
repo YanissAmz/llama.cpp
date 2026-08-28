@@ -843,6 +843,28 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
     }
 
+    // The NextN/MTP draft head reads the trunk's hidden state BEFORE the final norm -
+    // llama-graph.h documents t_h_nextn as "[n_embd, n_outputs] hidden state before
+    // final output norm", and the MTP block applies its own hnorm to it. It is NARROW
+    // (n_embd, not n_embd*hc) because the MTP block carries no mHC: blk.45 has none of
+    // the six hc_* tensors every trunk layer has, and eh_proj is [2*n_embd, n_embd].
+    //
+    // The unmasked case has to collapse BEFORE the output-row selection, since it wants
+    // a row per token. That costs one extra full-width hc_mean, and it is paid only when
+    // a target context is actually feeding an MTP draft head - never on a plain decode.
+    if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked) {
+        ggml_tensor * h_nextn = build_hc_mean(ctx0, inpL);
+        cb(h_nextn, "h_nextn", -1);
+        res->t_h_nextn = h_nextn;
+        // this node is a LEAF: nothing downstream consumes it, and the single expand at
+        // the end of this graph only walks back from t_logits. ggml_set_output() sets a
+        // flag, it does not add the node. Without this line the tensor is never computed
+        // and llama-context reads whatever the buffer held. Same pattern as t_layer_inp
+        // just above. The other MTP archs escape it by publishing a tensor already on the
+        // path; this branch is the only one that creates a new one.
+        ggml_build_forward_expand(gf, h_nextn);
+    }
+
     if (inp_out_ids) {
         // flattened: get_rows needs one token's streams to be one contiguous row
         ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
@@ -852,6 +874,11 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     // no hc_head tensor here: unweighted mean, not DeepSeek-V4's learned gated head
     cur = build_hc_mean(ctx0, inpL);
     cb(cur, "hc_mean", -1);
+
+    if (cparams.embeddings_nextn && cparams.embeddings_nextn_masked) {
+        cb(cur, "h_nextn", -1);
+        res->t_h_nextn = cur;
+    }
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
@@ -864,10 +891,144 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_build_forward_expand(gf, cur);
 }
 
+// LLM_GRAPH_TYPE_DECODER_MTP draft head for GLM-5.3-Flash (GLM5NEXT).
+// Semantics mirror the deepseek family and glm_dsa:
+//   enorm(embed) + hnorm(prev_hidden) -> concat(e, h) -> eh_proj ->
+//   one glm5next decoder block (dense absorbed MLA + sigmoid-gated MoE with shared
+//   expert) -> shared_head_norm (fallback output_norm) -> shared LM head.
+//
+// Two things differ from the trunk graph, and both are read off the checkpoint rather
+// than assumed:
+//
+//  1. NO mHC. blk.45 carries none of the six hc_* tensors every trunk layer carries,
+//     so there is no stream expansion, no build_hc_pre/post and no final mean here.
+//     The residual is a plain add, and the state stays [n_embd, n_tokens] throughout.
+//
+//  2. NO indexer. inp_kp = nullptr and scoring = false, so build_dsa_layer takes its
+//     dense branch. For a single draft token the indexer is an approximation of dense
+//     attention, so dense is more exact, never less; and the MTP context's KV cache
+//     holds only this layer, with no indexer cache to write into. glm_dsa makes the
+//     same choice for the same reason.
+llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
+    llama_model_glm5next::graph(params) {
+    GGML_ASSERT(hparams.n_layer_nextn > 0 && "GLM5NEXT MTP requires n_layer_nextn > 0");
+    GGML_ASSERT(hparams.n_layer_nextn == 1 && "GLM5NEXT MTP currently only supports a single MTP block");
+    GGML_ASSERT(cparams.nextn_layer_offset >= 0 &&
+                cparams.nextn_layer_offset < (int) hparams.n_layer_nextn &&
+                "nextn_layer_offset out of range [0, n_layer_nextn)");
+
+    const int il = hparams.n_layer() + cparams.nextn_layer_offset;
+
+    const auto & layer = model.layers[il];
+
+    GGML_ASSERT(layer.nextn.eh_proj && "MTP block missing nextn.eh_proj");
+    GGML_ASSERT(layer.nextn.enorm   && "MTP block missing nextn.enorm");
+    GGML_ASSERT(layer.nextn.hnorm   && "MTP block missing nextn.hnorm");
+    GGML_ASSERT(layer.ffn_gate_inp  && "MTP block missing ffn_gate_inp");
+
+    // this block is a trunk-shaped DSA layer, not a recurrent one: if a future
+    // checkpoint made it recurrent, build_dsa_layer below would be the wrong builder
+    GGML_ASSERT(!hparams.is_recr(il) && "GLM5NEXT MTP block must be an attention layer");
+
+    // TODO: extract in a common llm_graph_context::build_inp_embd_h()
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
+    ggml_set_input(inp->embd);
+
+    ggml_tensor * tok_embd;
+    if (ubatch.token) {
+        ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+
+        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+    } else {
+        tok_embd = inp->embd;
+    }
+    cb(tok_embd, "mtp_tok_embd", il);
+
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->h);
+    ggml_set_name(inp->h, "mtp_h_input");
+
+    ggml_tensor * h_embd = inp->h;
+
+    res->add_input(std::move(inp));
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    // absorbed MLA leaves a K-only cache (V is a view of K), and the MTP context's
+    // cache holds this layer alone - see the GLM5NEXT MTP branch in create_memory
+    llm_graph_input_attn_k * inp_attn = build_attn_inp_k();
+
+    // no build_inp_pos: build_dsa_layer asserts n_rot() == 0, the text tower is
+    // nope-only and there is no rope anywhere on this path
+
+    ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    cb(h_norm, "mtp_hnorm", il);
+
+    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    cb(e_norm, "mtp_enorm", il);
+
+    ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
+    cb(concat, "mtp_concat", il);
+
+    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
+    cb(cur, "mtp_eh_proj", il);
+
+    ggml_tensor * inpSA = cur;
+
+    cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_attn_norm", il);
+
+    cur = build_dsa_layer(layer, inp_attn, /*inp_kp=*/ nullptr, /*scoring=*/ false, cur, il);
+    cb(cur, "mtp_attn_out", il);
+
+    cur = ggml_add(ctx0, cur, inpSA);
+    cb(cur, "mtp_attn_residual", il);
+
+    ggml_tensor * ffn_inp = cur;
+
+    cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_ffn_norm", il);
+
+    cur = build_layer_ffn(model, cur, il);
+    cb(cur, "mtp_ffn_out", il);
+
+    cur = ggml_add(ctx0, cur, ffn_inp);
+    cb(cur, "mtp_l_out", il);
+
+    if (inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
+    // chained heads read this back as the next head's h; with n_layer_nextn == 1 nothing
+    // consumes it today, but publishing it keeps the contract the other MTP archs honour
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;
+    GGML_ASSERT(head_norm_w && "GLM5NEXT MTP missing shared head norm");
+
+    cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+    cb(cur, "mtp_result_norm", -1);
+    res->t_embd = cur;
+
+    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cb(cur, "mtp_result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
 std::unique_ptr<llm_graph_context> llama_model_glm5next::build_arch_graph(const llm_graph_params & params) const {
     // llama_init_from_model accepts an MTP context whenever n_layer_nextn > 0,
     // which every glm5next checkpoint has; without this it silently runs the trunk
-    GGML_ASSERT(params.gtype != LLM_GRAPH_TYPE_DECODER_MTP && "glm5next NextN graph not implemented yet");
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        return std::make_unique<graph_mtp>(*this, params);
+    }
 
     return std::make_unique<graph>(*this, params);
 }
