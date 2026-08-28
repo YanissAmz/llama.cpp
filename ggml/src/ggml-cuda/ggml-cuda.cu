@@ -2557,6 +2557,39 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
+#if defined(GGML_USE_HIP) && defined(GGML_CUDA_SORT_CUB)
+        // hipCUB ne supporte pas la capture de flux dans DeviceSegmentedRadixSort ni
+        // dans DeviceSegmentedSort: l'appel leve « operation not permitted when stream
+        // is capturing ». Le commentaire amont d'argsort.cu ne vaut que pour CCCL.
+        // Les deux voies sures sont la bitonique (ncols <= 1024) et le tri non segmente
+        // (une seule ligne par appel). Sinon on renonce au graphe pour CE graphe-la:
+        // c'est le prefill, et ca coute 18 % de prefill au lieu de planter.
+        if (node->op == GGML_OP_TOP_K || node->op == GGML_OP_ARGSORT) {
+            const ggml_tensor * src0  = node->src[0];
+            const int64_t       ncols = src0->ne[0];
+            const int64_t       nrows = ggml_nrows(src0);
+
+            size_t ncols_pad = 1;
+            while (ncols_pad < (size_t) ncols) {
+                ncols_pad *= 2;
+            }
+
+            const size_t max_shared_mem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
+            const bool   use_bitonic    = ncols_pad*sizeof(int) <= max_shared_mem && ncols <= 1024;
+
+            // meme decoupe qu'argsort_f32_i32_cuda_cub_chunk_nrows: 64 Mio par tranche
+            const int64_t chunk_nrows = std::min<int64_t>(
+                    std::max<int64_t>((1 << 26)/(int64_t) src0->nb[1], 1), nrows);
+
+            if (!use_bitonic && chunk_nrows > 1) {
+                use_cuda_graph = false;
+#ifndef NDEBUG
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs, hipCUB segmented sort cannot be captured\n", __func__);
+#endif
+            }
+        }
+#endif // GGML_USE_HIP && GGML_CUDA_SORT_CUB
+
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -5260,7 +5293,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_TOP_K:
         case GGML_OP_ARGSORT:
-#ifndef GGML_CUDA_USE_CUB
+#ifndef GGML_CUDA_SORT_CUB
             return op->src[0]->ne[0] <= 1024;
 #else
             return true;

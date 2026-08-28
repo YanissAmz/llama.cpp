@@ -130,6 +130,13 @@
 #define cudaGraphNodeTypeKernel hipGraphNodeTypeKernel
 #define cudaGraphInstantiate hipGraphInstantiate
 #define cudaStreamEndCapture hipStreamEndCapture
+// Le correctif GGML_CUDA_SORT_CUB interroge la capture de graphe depuis argsort.cu
+// (DeviceSegmentedSort ne supporte pas la capture, DeviceSegmentedRadixSort si).
+// L'arbre qwen4exp porte deja ces trois shims; celui-ci est plus ancien et ne les a pas.
+// Sans eux, le fichier compile en CUDA et echoue en HIP sur des noms inconnus.
+#define cudaStreamIsCapturing hipStreamIsCapturing
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
 #define cudaGraphDestroy hipGraphDestroy
 #define cudaGraphKernelNodeSetParams hipGraphKernelNodeSetParams
 #define cudaErrorInvalidDeviceFunction hipErrorInvalidDeviceFunction

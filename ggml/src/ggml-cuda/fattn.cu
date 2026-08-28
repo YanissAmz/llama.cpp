@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
@@ -512,7 +513,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD WMMA is always faster than the tile kernel if the full tile width of 16 can be utilized.
-    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 128) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
+    //
+    // The head-size guard is 128 upstream. Note the MFMA branch just above already lets
+    // head size 256 reach the MMA kernel, it only asks for a larger batch (> 64) to pay
+    // for the wider head. The WMMA branch has no such graduated rule: everything above
+    // 128 goes to the generic tile kernel. On gfx1151 that kernel runs one wave per
+    // workgroup and dominates the profile for head-256 architectures.
+    // GGML_CUDA_FA_WMMA_MAX_HEAD raises the guard so the two kernels can be compared as
+    // a setting rather than a rebuild. Default is unchanged.
+    static const int wmma_max_head = [] {
+        const char * env = getenv("GGML_CUDA_FA_WMMA_MAX_HEAD");
+        return env ? atoi(env) : 128;
+    }();
+
+    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= wmma_max_head) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
