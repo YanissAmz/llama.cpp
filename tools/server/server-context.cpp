@@ -1,3 +1,4 @@
+#include <cstdlib>   // getenv, atoi : bascule SPEC_CKPT_ON_DEVICE
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -33,6 +34,27 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+
+// ---------------------------------------------------------------------------------------------
+// #28118 / #28104 : les checkpoints SPECULATIFS peuvent rester sur le peripherique.
+// Ce n'est PAS un correctif qwen : c'est un correctif SERVEUR. Il vaut pour toute cible
+// hybride-recurrente qui speculate, donc aussi pour glm5next (couches GDN). La cible ne sait
+// pas faire de seq_rm partiel => checkpoint d'etat COMPLET a chaque ronde speculative, et par
+// le chemin hote cela serialise chaque couche GDN avec une lecture backend SYNCHRONE par
+// tenseur. La bibliotheque implemente deja ON_DEVICE ; le serveur ne l'a jamais demande.
+// Bascule a l'execution pour que l'A/B sorte d'UN SEUL binaire : SPEC_CKPT_ON_DEVICE=1.
+// `=0` ne bascule PAS. Defaut = OFF = comportement d'aujourd'hui.
+// ATTENTION : llama-memory-recurrent.cpp:801 ABORTE si cell_ranges.size() > 1 sous ON_DEVICE.
+// Les checkpoints de PROMPT (slot.prompt.checkpoints) restent en hote DELIBEREMENT.
+static llama_state_seq_flags spec_ckpt_flags() {
+    static const llama_state_seq_flags f = [] {
+        const char * e = getenv("SPEC_CKPT_ON_DEVICE");
+        const bool   on = e != nullptr && atoi(e) != 0;
+        return (llama_state_seq_flags) (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
+                                        (on ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : 0u));
+    }();
+    return f;
+}
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
@@ -2904,7 +2926,7 @@ private:
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
                         if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, spec_ckpt_flags());
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
@@ -2943,7 +2965,7 @@ private:
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {
-                    ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.load_dft(ctx_dft, slot.id, spec_ckpt_flags());
                 }
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
@@ -2962,7 +2984,7 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_tgt(ctx_tgt, slot.id, spec_ckpt_flags());
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -2974,7 +2996,7 @@ private:
                 }
 
                 if (use_ckpt_dft) {
-                    ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_dft(ctx_dft, slot.id, spec_ckpt_flags());
                 }
             }
         });
@@ -3821,10 +3843,10 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        ckpt.load_tgt(slot.ctx_tgt, slot.id, spec_ckpt_flags());
 
                         if (slot.ctx_dft) {
-                            ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            ckpt.load_dft(slot.ctx_dft, slot.id, spec_ckpt_flags());
                         }
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
